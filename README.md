@@ -40,23 +40,39 @@ Jedes Modul baut logisch auf dem vorherigen auf.
 # ⚠️ Wichtiger Hinweis zur Projektstruktur (VS Code)
 
 Dieses Repository enthält mehr als 40 eigenständige Source-Module.
+
 Jedes Verzeichnis ist als separates Projekt aufgebaut.
+
 ➡️ Daher muss jedes Modul einzeln in Visual Studio Code geöffnet werden.
 
 ✔️ Richtig
+
 VS Code → File → Open Folder → MESH-RADIO-KAP7/moduleXX
+
 ❌ Nicht empfohlen
+
 Gesamtes Repository als ein einziges VS Code Projekt öffnen
+
 Dies führt typischerweise zu:
+
 fehlerhaften Build-Konfigurationen
+
 falschen Include-Pfaden
+
 Konflikten zwischen Build-Systemen
+
 nicht reproduzierbaren Ergebnissen
+
 Hintergrund
+
 Die Module repräsentieren einzelne Entwicklungsstufen des MeshRadio-Engineering-Prozesses und besitzen jeweils eigene Build-Umgebungen.
+
 Die isolierte Nutzung stellt sicher, dass:
+
 Builds reproduzierbar bleiben
+
 Abhängigkeiten korrekt aufgelöst werden
+
 jede Entwicklungsstufe unabhängig getestet werden kann
 
 ## 🧩 Zielsetzung
