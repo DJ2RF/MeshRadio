@@ -1,3 +1,9 @@
+# Dieses Repository begleitet das Buch MeshRadio – Embedded LoRa Mesh Engineering.
+# https://nerdverlag.com  Buch MeshRadio – Embedded LoRa Mesh Engineering
+# fritz@nerdverlag.com
+
+Der Fokus liegt auf Engineering-Verständnis, Architekturentscheidungen und reproduzierbarer Embedded-Entwicklung — nicht auf schnellen Copy-Paste-Lösungen.
+
 # 🚀 MeshRadio – Embedded LoRa Mesh Engineering
 
 Vom experimentellen LoRa-Chat zum professionellen Mesh-System
@@ -12,16 +18,11 @@ Es ist ein Engineering-Guide.
 ## 🎯 Fokus des Projekts
 
 Systematischer Aufbau eines LoRa-Mesh-Stacks
-
 Stabile Routing-Logik und Node-Rollen
-
 Embedded-Architektur für reale Funkbedingungen
-
 Sicherheit mit AES-CCM und Replay-Schutz
-
 Praktische Entwicklung direkt auf ESP32-basierter Hardware
-
-Alle Konzepte werden anhand realer, lauffähiger Software erklärt.
+Alle Konzepte werden anhand realer, getesteter und lauffähiger Software erklärt.
 
 ## 📂 Repository-Struktur
 
@@ -30,11 +31,8 @@ Das begleitende GitHub-Repository enthält mehr als 40 sauber strukturierte Sour
 Ziel ist es, jede Phase nachvollziehbar zu machen:
 
 verstehen
-
 testen
-
 erweitern
-
 weiterentwickeln
 
 Jedes Modul baut logisch auf dem vorherigen auf.
@@ -44,13 +42,9 @@ Jedes Modul baut logisch auf dem vorherigen auf.
 Das Ergebnis ist kein theoretisches Beispiel, sondern ein praxisnahes Framework — geeignet für:
 
 Entwickler
-
 Maker
-
 Forschung
-
 industrielle Prototypen
-
 Funkexperimente
 
 ## ⚠️ Haftungsausschluss
@@ -63,11 +57,8 @@ Der Autor übernimmt keine Haftung für Schäden, Datenverlust oder Fehlfunktion
 ## 🧾 Garantie / Gewährleistung
 
 Es besteht keine ausdrückliche oder stillschweigende Garantie, einschließlich:
-
 Fehlerfreiheit
-
 Eignung für einen bestimmten Zweck
-
 dauerhafte Stabilität unter allen Bedingungen
 
 ## © Copyright
@@ -82,7 +73,3 @@ Alle Rechte vorbehalten, sofern nicht durch die Lizenz anders geregelt.
 
 Siehe Datei:
 
-
-Dieses Repository begleitet das Buch MeshRadio – Embedded LoRa Mesh Engineering.
-
-Der Fokus liegt auf Engineering-Verständnis, Architekturentscheidungen und reproduzierbarer Embedded-Entwicklung — nicht auf schnellen Copy-Paste-Lösungen.
