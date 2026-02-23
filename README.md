@@ -1,6 +1,6 @@
-# Dieses Repository begleitet das Buch MeshRadio – Embedded LoRa Mesh Engineering.
-# https://nerdverlag.com  Buch MeshRadio – Embedded LoRa Mesh Engineering
-# fritz@nerdverlag.com
+## Dieses Repository begleitet das Buch MeshRadio – Embedded LoRa Mesh Engineering.
+## https://nerdverlag.com  Buch MeshRadio – Embedded LoRa Mesh Engineering
+## fritz@nerdverlag.com
 
 Der Fokus liegt auf Engineering-Verständnis, Architekturentscheidungen und reproduzierbarer Embedded-Entwicklung — nicht auf schnellen Copy-Paste-Lösungen.
 
