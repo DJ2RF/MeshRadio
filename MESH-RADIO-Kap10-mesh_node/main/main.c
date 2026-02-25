@@ -674,7 +674,7 @@ void app_main(void)
         t++;
 
         if (t % 15 == 0) {
-            mr_send_message("*", "CQ CQ MeshRadio 4.0", false);
+            mr_send_message("*", "CQ CQ MeshRadio", false);
         }
 
         if (t % 20 == 0) {

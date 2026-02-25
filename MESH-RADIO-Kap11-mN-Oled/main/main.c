@@ -41,7 +41,7 @@
 // ============================================================
 
 // ============================================================================
-// MeshRadio 4.0 – Kapitel 11 (FINAL, robust) | ESP-IDF v5.5.x
+// MeshRadio – Kapitel 11 (FINAL, robust) | ESP-IDF v5.5.x
 //
 // ✅ LoRa Beacon senden/empfangen
 // ✅ Neighbor-Tabelle (Call + RSSI + Timeout)
@@ -470,7 +470,7 @@ static void oled_init_lib(void)
     }
 
     (void)ssd1306_clear_display(oled, false);
-    (void)ssd1306_display_text(oled, 0, "MeshRadio 4.0", false);
+    (void)ssd1306_display_text(oled, 0, "MeshRadio", false);
     (void)ssd1306_display_text(oled, 1, MY_CALL, false);
 
     ESP_LOGI(TAG, "OLED: init OK (addr=0x%02X)", (unsigned)real_addr);

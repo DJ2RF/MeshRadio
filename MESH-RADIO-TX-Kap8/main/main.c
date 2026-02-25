@@ -1,3 +1,42 @@
+// ============================================================
+// MeshRadio – Embedded LoRa Mesh Engineering
+// Source Header (Open Engineering Edition)
+// ============================================================
+//
+// © 2026 Friedrich Riedhammer (DJ2RF)
+// https://nerdverlag.com
+// Contact: [fritz@nerdverlag.com](mailto:fritz@nerdverlag.com)
+//
+// ------------------------------------------------------------
+// Project Philosophy
+// ------------------------------------------------------------
+// This project follows an Open Engineering approach.
+//
+// The sources are provided for learning, experimentation,
+// research, and further development of embedded LoRa mesh
+// systems.
+//
+// Goal:
+// Understanding system architecture instead of using
+// black-box solutions.
+//
+// Guiding principle:
+// "profi-level stabil"
+// Stability first. Deterministic design over features.
+//
+// ------------------------------------------------------------
+// Usage & License Notes
+// ------------------------------------------------------------
+// - Educational and experimental use is encouraged.
+// - Modification and extension are allowed.
+// - Commercial usage or redistribution requires
+//   prior permission from the author.
+//
+// ------------------------------------------------------------
+// Additional Resources
+// ------------------------------------------------------------
+// All chapter sources and updates:
+// https://nerdverlag.com
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
@@ -303,7 +342,7 @@ void app_main(void)
     ESP_LOGI(TAG, "MR TX (polling) started.");
 
     while (1) {
-        const char *payload_txt = "Hallo MeshRadio 4.0 von DJ2RF";
+        const char *payload_txt = "Hallo MeshRadio von DJ2RF";
         uint8_t packet[256];
 
         size_t pkt_len = mr_build_frame(
