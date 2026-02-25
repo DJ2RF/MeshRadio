@@ -15,3 +15,4 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   jgromes/radiolib: ^7.6.0
+  k0i05/esp_ssd1306: '*'
