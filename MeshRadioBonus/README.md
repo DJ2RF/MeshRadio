@@ -6,6 +6,10 @@
 
 ## fritz@nerdverlag.com
 
+<p align="center">
+<img src="docs/coverLoRa.png" width="400">
+</p>
+
 # MeshRadio – LoRa Mesh Node (ESP-IDF)
 
 MeshRadio ist ein zuverlässiger LoRa-Mesh-Knoten für ESP32-basierte Hardware, entwickelt mit ESP-IDF.
