@@ -129,6 +129,10 @@ RELAY	vollständiger Mesh-Router
 EDGE	Endgerät
 SENSOR	energieoptimierter Sensorknoten
 
+<p align="center">
+<img src="MeshRadio/MeshRadioBonus/docs/BedienTableau.png" width="500">
+</p>
+
 Standard:
 
 #define DEFAULT_NODE_MODE 0
