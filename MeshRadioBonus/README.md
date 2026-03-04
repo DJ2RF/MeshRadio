@@ -130,7 +130,8 @@ EDGE	Endgerät
 SENSOR	energieoptimierter Sensorknoten
 
 <p align="center">
-<img src="docs/BedienTableau.png" width="500">
+<img src="docs/BedienTableau.png" width="300">
+<img src="docs/Wetteraufzeichnung.png" width="400">
 </p>
 
 Standard:
