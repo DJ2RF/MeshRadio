@@ -2,6 +2,10 @@
 ## https://nerdverlag.com  Buch MeshRadio – Embedded LoRa Mesh Engineering
 ## fritz@nerdverlag.com
 
+<p align="center">
+<img src="MeshRadioBonus/docs/coverLoRa.png" width="400">
+</p>
+
 Der Fokus liegt auf Engineering-Verständnis, Architekturentscheidungen und reproduzierbarer Embedded-Entwicklung — nicht auf schnellen Copy-Paste-Lösungen.
 
 # 🚀 MeshRadio – Embedded LoRa Mesh Engineering
