@@ -130,7 +130,7 @@ EDGE	Endgerät
 SENSOR	energieoptimierter Sensorknoten
 
 <p align="center">
-<img src="MeshRadio/MeshRadioBonus/docs/BedienTableau.png" width="500">
+<img src="docs/BedienTableau.png" width="500">
 </p>
 
 Standard:
