@@ -75,7 +75,7 @@
 #define PIN_LORA_DIO0       26
 
 #ifndef RELAY_GPIO
-#define RELAY_GPIO          14
+#define RELAY_GPIO          25
 #endif
 
 // Battery sense beim T3 V1.6.1: GPIO35, Teiler 100k/100k (Faktor 2.0)

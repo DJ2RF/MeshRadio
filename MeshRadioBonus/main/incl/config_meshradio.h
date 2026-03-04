@@ -58,6 +58,11 @@
  */
 #define MR_CALLSIGN        "DL7ABCF"
 
+// Optional: Ziel-Callsign für den "AWAKE"-Ping des Sensors
+#define MR_RELAY_CALLSIGN "DJ1ABCF"   // <-- hier dein RELAY Callsign eintragen
+
+
+
 /*
  * MR_WIFI_AP_SSID / MR_WIFI_AP_PASS:
  *   - SSID/Passwort des Access Points (Web-Dashboard)
@@ -76,8 +81,8 @@
  *       863000000UL (EU 863–870)
  *       433050000UL (433 MHz Band – experimentell/je nach Region)
  */
-// #define DEFAULT_RF_FREQ_HZ 863000000UL
-#define DEFAULT_RF_FREQ_HZ 433050000UL
+#define DEFAULT_RF_FREQ_HZ 863000000UL
+// #define DEFAULT_RF_FREQ_HZ 433050000UL
 
 // ---- Control Plane ----
 /*
