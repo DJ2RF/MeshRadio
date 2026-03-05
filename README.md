@@ -1,3 +1,6 @@
+ESP32 LoRa Mesh Network implementation using SX1276 and SX1262 radios with ESP-IDF.
+Supports multi-hop routing, AES encryption, WiFi configuration and sensor nodes.
+
 ## Dieses Repository begleitet das Buch MeshRadio – Embedded LoRa Mesh Engineering.
 ## https://nerdverlag.com  Buch MeshRadio – Embedded LoRa Mesh Engineering
 ## fritz@nerdverlag.com
@@ -114,4 +117,15 @@ Alle Rechte vorbehalten, sofern nicht durch die Lizenz anders geregelt.
 ## 📜 Lizenz
 
 Siehe Datei:
+
+## Keywords
+
+ESP32 LoRa Mesh Network  
+LoRa mesh routing  
+ESP-IDF LoRa  
+SX1276 LoRa mesh  
+SX1262 LoRa mesh  
+IoT mesh network  
+Wireless sensor network
+
 
