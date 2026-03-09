@@ -31,5 +31,5 @@ direct_dependencies:
 - idf
 - k0i05/esp_ssd1306
 manifest_hash: 26344c1d46e58844adf192c11c1127fddbd25b8d2e8400b60a2f2f7bb75ed9ec
-target: esp32
+target: esp32s3
 version: 2.0.0

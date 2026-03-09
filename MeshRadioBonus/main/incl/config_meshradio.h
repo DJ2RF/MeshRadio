@@ -1,31 +1,78 @@
-/* ============================================================================
- * FILE: config_meshradio.h
- * ============================================================================
+/******************************************************************************
+ *  MeshRadio Project
  *
- *  MeshRadio – Dokumentations-Header (User Defines)
- * ============================================================================
+ *  FILE: config_meshradio.h
  *
- *  Copyright (c) 2025–2026
- *  Friedrich Riedhammer  / DJ2RF
+ *  DESCRIPTION
+ *  ---------------------------------------------------------------------------
+ *  Central configuration file for the MeshRadio firmware.
  *
- *  Projekt: MeshRadio (ESP-IDF v5.5.2)
- *  Zweck  : "profi-level stabil" LoRa-Mesh (SX1276/SX1278 und SX1262 umschaltbar)
+ *  This header defines all user-adjustable configuration parameters used by
+ *  the MeshRadio system. It acts as the main control panel for enabling or
+ *  disabling features, selecting hardware platforms, and adjusting network
+ *  behavior.
  *
- *  Lizenz / Nutzung:
- *  - Nutzung, Anpassung und Weitergabe für Bildung / Amateurfunk-Projekte erlaubt.
- *  - Kommerzielle Nutzung/Weitergabe nur mit Zustimmung des Autors.
+ *  The configuration options include:
  *
- *  Haftungsausschluss:
- *  - Bereitgestellt "as-is" ohne Garantie.
- *  - Verantwortung für Funkregeln, Interferenzen, Schäden und Betrieb liegt beim Nutzer.
+ *      • Board selection and hardware presets
+ *      • Node identity (callsign)
+ *      • WiFi access point configuration
+ *      • LoRa radio frequency and regional band settings
+ *      • Mesh control plane parameters (beacons, routing, ACK retries)
+ *      • Token bucket rate limiting
+ *      • Optional channel activity detection (CAD)
+ *      • AES-CCM encryption and network security parameters
+ *      • Node operating roles (RELAY, EDGE, SENSOR)
+ *      • Power management and deep sleep behavior
+ *      • Relay control features
+ *      • Battery monitoring configuration
+ *      • Serial command line interface (CLI)
+ *      • Optional sensors (e.g. BME280)
  *
- * ============================================================================
- *  WICHTIG:
- *  - Die folgenden Defines sind die zentralen Projekt-Schalter.
- *  - Reihenfolge entspricht exakt der Konfiguration im Code.
- *  - Jede Option ist kurz beschrieben, damit man sie im Projekt/Buch sofort versteht.
- * ============================================================================
- */
+ *  The options defined in this file are intentionally documented in detail
+ *  to support both firmware development and educational use in the MeshRadio
+ *  documentation and book series.
+ *
+ *  IMPORTANT
+ *  ---------------------------------------------------------------------------
+ *  - This file is the primary configuration entry point for the firmware.
+ *  - Changes here directly affect network behavior and hardware operation.
+ *  - Board presets determine pin mapping and radio driver selection.
+ *
+ *
+ *  AUTHOR
+ *  ---------------------------------------------------------------------------
+ *  Friedrich Riedhammer (Fritz)
+ *  NerdVerlag
+ *  https://nerdverlag.com
+ *  fritz@nerdverlag.com
+ *
+ *
+ *  COPYRIGHT
+ *  ---------------------------------------------------------------------------
+ *  (c) 2026 Friedrich Riedhammer / NerdVerlag
+ *
+ *  This software is provided "as is", without any express or implied warranty.
+ *  In no event will the author be held liable for any damages arising from
+ *  the use of this software.
+ *
+ *  Permission is granted to use, modify, and distribute this software for
+ *  educational, experimental, and amateur radio purposes, provided that this
+ *  copyright notice and this disclaimer remain intact in all copies.
+ *
+ *  Commercial use or redistribution requires permission from the author.
+ *
+ *  This software is intended for experimentation and research in wireless
+ *  mesh networking using LoRa technology. The author does not guarantee
+ *  correctness, regulatory compliance, or suitability for any specific
+ *  purpose.
+ *
+ *  Users are responsible for complying with local radio regulations.
+ *
+ *  Use at your own risk.
+ *
+ ******************************************************************************/
+
 #pragma once
 
 // ---- Board Presets (einfach hier umschalten) ----
@@ -45,22 +92,25 @@
  * MR_BOARD_PRESET:
  *   - Auswahl des aktiven Boards (1 von 2 Presets)
  *   - Umschalten hier bestimmt Pinout, LoRa-Chip-Treiber und Board-Fixes.
+ *  
+ * - Wichtig: Bei Änderung hier auch die entsprechende Board-Auswahl in der
+ *  Build-Konfiguration (KConfig) anpassen, damit die richtigen Quellen kompiliert
+ *  werden.
  */
 #ifndef MR_BOARD_PRESET
-#define MR_BOARD_PRESET MR_BOARD_LILYGO_SX1276 // MR_BOARD_HELTEC_V3  // <-- HIER UMSCHALTEN
+#define MR_BOARD_PRESET MR_BOARD_HELTEC_V3 // MR_BOARD_HELTEC_V3  // <-- HIER UMSCHALTEN
 #endif
 
 // ---- Callsign / WiFi ----
 /*
- * MR_CALLSIGN:
+ * g_callsign:
  *   - Node-ID/Callsign (max. 7 Zeichen werden im Protokoll genutzt)
  *   - Wird in Frames als Quelle (src) verwendet und im Web/CLI angezeigt.
+ * 
  */
+
 #define MR_CALLSIGN        "DL7ABCF"
-
-// Optional: Ziel-Callsign für den "AWAKE"-Ping des Sensors
-#define MR_RELAY_CALLSIGN "DJ1ABCF"   // <-- hier dein RELAY Callsign eintragen
-
+#define MR_RELAY_CALLSIGN  "DJ1ABCF"
 
 
 /*
@@ -69,7 +119,7 @@
  *   - PASS = ""  -> OPEN (ohne Passwort)
  *   - PASS >= 8  -> WPA2-PSK
  */
-#define MR_WIFI_AP_SSID    "MeshRadio-Setup3"
+#define MR_WIFI_AP_SSID    "MeshRadio-Setup4"
 #define MR_WIFI_AP_PASS    ""          // "" => OPEN; >=8 Zeichen => WPA2-PSK
 
 // ---- RF Frequency (EU 863–870) ----
@@ -81,8 +131,8 @@
  *       863000000UL (EU 863–870)
  *       433050000UL (433 MHz Band – experimentell/je nach Region)
  */
-#define DEFAULT_RF_FREQ_HZ 863000000UL
-// #define DEFAULT_RF_FREQ_HZ 433050000UL
+//#define DEFAULT_RF_FREQ_HZ 863000000UL
+#define DEFAULT_RF_FREQ_HZ 433050000UL
 
 // ---- Control Plane ----
 /*
@@ -169,7 +219,7 @@
  *   - 1: AES-CCM aktiv
  *   - 0: Klartext
  */
-#define DEFAULT_CRYPTO_ENABLE  0
+#define DEFAULT_CRYPTO_ENABLE  1
 #define MR_NET_KEY_HEX "00112233445566778899AABBCCDDEEFF"
 #define MR_NET_ID 0x42
 
@@ -177,12 +227,16 @@
 #define SEC_NONCE_LEN      12
 #define SEC_TAG_LEN        8
 
+#if SEC_TAG_LEN != 8
+#error "SEC_TAG_LEN must be 8 for MeshRadio protocol"
+#endif
+
 // ---- Kapitel 34 Node Roles ----
 /*
  * DEFAULT_NODE_MODE:
  *   - 0 = RELAY, 1 = EDGE, 2 = SENSOR
  */
-#define DEFAULT_NODE_MODE  0   // 0=RELAY, 1=EDGE, 2=SENSOR
+#define DEFAULT_NODE_MODE  2   // 0=RELAY, 1=EDGE, 2=SENSOR
 
 // ---- Power save  ----
 /*
@@ -190,8 +244,8 @@
  *   - 1: DeepSleep Support aktiv (typisch nur SENSOR)
  *   - 0: Dauerbetrieb
  */
-#define MR_POWERSAVE_ENABLE       0         // not at Relay and Edge, optional at Sensor
-#define SENSOR_WAKE_PERIOD_MS     300000
+#define MR_POWERSAVE_ENABLE       1         // not at Relay and Edge, optional at Sensor
+#define SENSOR_WAKE_PERIOD_MS     60000
 #define SENSOR_BOOT_RX_WINDOW_MS  30000
 
 /*
@@ -202,7 +256,7 @@
 #define EDGE_DUTY_RX_ENABLE       0
 #define EDGE_RX_ON_MS             600
 #define EDGE_RX_OFF_MS            1400
-#define MR_RELAY_CALLSIGN "DJ1ABCF"
+
 
 // ---- WiFi runtime default ----
 /*
@@ -219,7 +273,11 @@
  *   - 0: aus
  */
 #define MR_RELAY_ENABLE           1
+
 #define RELAY_ACTIVE_LEVEL        1   // 1: HIGH=ON, 0: LOW=ON
+
+// RELAY_GPIO: siehe board_pins.h, wird hier nur als Default definiert, kann aber auch zur Laufzeit geändert werden
+// #define RELAY_GPIO                35  //25  // default relay pin
 
 // ---- Station: Battery ADC ----
 /*
@@ -230,7 +288,8 @@
 #define MR_BATT_ENABLE            1
 #define BATT_MEASURE_INTERVAL_MS  5000
 #define BATT_EMPTY_MV             3300
-#define BATT_FULL_MV              3900
+#define BATT_FULL_MV              4200
+#define BATT_CAL_FACTOR 1.13f  // Kalibrierungsfaktor für ADC-Wert (z.B. 1.13 = 13% höher als gemessen, um realen Wert zu treffen)
 #define MR_ADC_CALI_MODE          0
 
 // ---- Serial CLI ----
@@ -247,7 +306,7 @@
  *   - 1: BME280 aktiv
  *   - 0: aus
  */
-#define MR_BME280_ENABLE          0
+#define MR_BME280_ENABLE          1
 #define BME280_I2C_ADDR           0x76   // oft 0x76, manchmal 0x77
 #define BME280_I2C_CLK_HZ         100000 // 100k = robust
 

@@ -16,6 +16,7 @@ Auto command on next AWAKE
 Link Quality display (based on RSSI)
 Node list with last seen timestamps
 TX window protection
+Help button with online documentation link
 
 Author
 ------
@@ -35,6 +36,7 @@ import datetime as dt
 import re
 import threading
 import time
+import webbrowser
 from collections import deque
 
 import serial
@@ -47,9 +49,13 @@ import tkinter as tk
 from tkinter import ttk
 
 VERSION = "MRVIS v1.0 (c) nerdverlag.com"
+HELP_URL = "https://nerdverlag.com/?page_id=719"
+
+# AWAKE must trigger in all cases, with or without WX payload
+AWAKE_RE = re.compile(r"\bSENSOR:AWAKE\b", re.IGNORECASE)
 
 WX_RE = re.compile(
-    r"SENSOR:AWAKE\s+WX\s+"
+    r"SENSOR:AWAKE(?:\s+WX\s+|\s+.*?\bWX\s+)"
     r"t=(?P<t>-?\d+(?:\.\d+)?)C\s+"
     r"p=(?P<p>\d+)hPa\s+"
     r"rh=(?P<rh>\d+(?:\.\d+)?)%\s+"
@@ -59,7 +65,6 @@ WX_RE = re.compile(
 )
 
 # Robust RSSI anywhere in the line
-# Example: "from=DL1ABCF rssi=-37 ..." etc.
 RSSI_RE = re.compile(r"\b(?:RSSI|rssi)\s*[:=]\s*(?P<rssi>-?\d+)\b")
 
 # Sender callsign for node list (supports: from=DL1ABCF, from:DL1ABCF)
@@ -144,12 +149,6 @@ def tx_window_ok(window_s: int) -> tuple[bool, int]:
 
 
 def rssi_to_quality(rssi: int | None) -> tuple[int | None, str]:
-    """
-    Map RSSI (dBm) to a 0..100 quality percentage + simple bar.
-    Conservative defaults:
-      -120 dBm -> 0%
-      -30  dBm -> 100%
-    """
     if rssi is None:
         return None, "—"
     lo, hi = -120.0, -30.0
@@ -191,8 +190,15 @@ def serial_reader(args):
             continue
 
         line = raw.decode("utf-8", errors="replace").strip()
-        m = WX_RE.search(line)
-        if not m:
+        if not line:
+            continue
+
+        # Must trigger on every AWAKE, even if no WX data follows
+        awake = AWAKE_RE.search(line)
+        wxm = WX_RE.search(line)
+
+        # Ignore unrelated lines
+        if not awake and not wxm:
             continue
 
         # Optional RSSI anywhere in the line
@@ -211,25 +217,20 @@ def serial_reader(args):
             call = (fm.group("call") or "").strip() or None
 
         ts = dt.datetime.now()
-        t_c = float(m.group("t"))
-        p_hpa = int(m.group("p"))
-        rh = float(m.group("rh"))
-        mv = int(m.group("bat_mv"))
-        pct = int(m.group("bat_pct"))
 
         do_auto = False
         auto_payload = ""
 
         with S.lock:
-            S.last_sample = (ts, t_c, p_hpa, rh, mv, pct, line)
-            S.samples.append((ts, t_c, p_hpa, rh, mv, pct))
-            S.last_awake_ts = ts
+            # Every AWAKE opens the TX window / arms the trigger condition
+            if awake:
+                S.last_awake_ts = ts
 
-            # Only update if present; otherwise keep last known value
+            # Only update RSSI if present
             if rssi is not None:
                 S.last_rssi = rssi
 
-            # Update node list (only if we have a callsign)
+            # Update node list even for bare AWAKE lines
             if call:
                 ent = S.nodes.get(call)
                 if ent is None:
@@ -240,7 +241,19 @@ def serial_reader(args):
                     ent["rssi"] = rssi
                 ent["last_line"] = line
 
-            if S.auto_armed and S.auto_payload.strip():
+            # WX data is optional; only store sample if fully present
+            if wxm:
+                t_c = float(wxm.group("t"))
+                p_hpa = int(wxm.group("p"))
+                rh = float(wxm.group("rh"))
+                mv = int(wxm.group("bat_mv"))
+                pct = int(wxm.group("bat_pct"))
+
+                S.last_sample = (ts, t_c, p_hpa, rh, mv, pct, line)
+                S.samples.append((ts, t_c, p_hpa, rh, mv, pct))
+
+            # Auto command must fire on ANY AWAKE
+            if awake and S.auto_armed and S.auto_payload.strip():
                 do_auto = True
                 auto_payload = S.auto_payload.strip()
                 S.auto_armed = False
@@ -375,7 +388,6 @@ def start_control_window(args):
     )
     frmAuto.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
 
-    # Status line (no popups)
     lblStatus = ttk.Label(frmAuto, text="status: ready", foreground="#444")
     lblStatus.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
@@ -383,6 +395,13 @@ def start_control_window(args):
         lblStatus.config(
             text=f"status: {msg}", foreground=("#228822" if ok else "#aa3333")
         )
+
+    def open_help():
+        try:
+            webbrowser.open(HELP_URL)
+            set_status("help page opened in browser", ok=True)
+        except Exception as e:
+            set_status(f"cannot open help page: {e}", ok=False)
 
     def guarded_send(payload: str):
         payload = (payload or "").strip()
@@ -409,7 +428,11 @@ def start_control_window(args):
             set_status("TX failed (serial not ready?)", ok=False)
 
     ttk.Button(frmMid, text="SEND (ACK=1)", command=lambda: guarded_send(varPay.get())).grid(
-        row=0, column=4, sticky="e"
+        row=0, column=4, sticky="e", padx=(0, 6)
+    )
+
+    ttk.Button(frmMid, text="HELP", command=open_help).grid(
+        row=0, column=5, sticky="e"
     )
 
     def mkbtn(txt, payload):
@@ -426,7 +449,6 @@ def start_control_window(args):
         b.grid(row=0, column=i, sticky="ew", padx=5)
         frmBot.columnconfigure(i, weight=1)
 
-    # Auto command: keep StringVar, but READ from Entry directly (bulletproof)
     varAuto = tk.StringVar(value="")
     entAuto = ttk.Entry(frmAuto, textvariable=varAuto, width=55)
     entAuto.grid(row=0, column=0, sticky="ew", padx=(0, 10))
@@ -441,7 +463,6 @@ def start_control_window(args):
     lblLog = ttk.Label(frmAuto, text="log: (none)")
     lblLog.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
-    # ---- Link Quality display (based on RSSI) ----
     frmLink = ttk.Frame(root, padding=10)
     frmLink.grid(row=4, column=0, sticky="ew")
 
@@ -449,9 +470,7 @@ def start_control_window(args):
     lblLink = ttk.Label(frmLink, text="LQ=—  RSSI=—", font=("Segoe UI", 11, "bold"))
     lblLink.grid(row=0, column=1, sticky="w", padx=(6, 0))
     frmLink.columnconfigure(1, weight=1)
-    # ---------------------------------------------
 
-    # ---- Node list (multiple Mesh nodes) ----
     frmNodes = ttk.LabelFrame(root, text="Nodes (last seen)", padding=10)
     frmNodes.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
     root.grid_rowconfigure(5, weight=1)
@@ -476,7 +495,6 @@ def start_control_window(args):
     vsb.grid(row=0, column=1, sticky="ns")
     frmNodes.columnconfigure(0, weight=1)
     frmNodes.rowconfigure(0, weight=1)
-    # ---------------------------------------
 
     sent_until = {"ts": None}
 
@@ -536,7 +554,6 @@ def start_control_window(args):
     btnDisarm = ttk.Button(frmAuto, text="DISARM")
     btnDisarm.grid(row=1, column=1, sticky="e", pady=(8, 0))
 
-    # Both command + bind, to guarantee click handling
     btnArm.configure(command=arm_auto)
     btnDisarm.configure(command=disarm_auto)
     btnArm.bind("<Button-1>", lambda e: arm_auto())
@@ -545,13 +562,13 @@ def start_control_window(args):
     ui_set_disarmed()
 
     def refresh_nodes_table(nodes_snapshot: dict):
-        # nodes_snapshot: call -> {"last_seen": dt, "rssi": int|None, ...}
         now = dt.datetime.now()
 
         rows = []
         for call, ent in nodes_snapshot.items():
             last_seen = ent.get("last_seen")
             rssi = ent.get("rssi")
+            age_s = 10**9
             if isinstance(last_seen, dt.datetime):
                 age_s = int((now - last_seen).total_seconds())
                 last_txt = f"{age_s}s"
@@ -560,12 +577,10 @@ def start_control_window(args):
             q, bar = rssi_to_quality(rssi if isinstance(rssi, int) else None)
             rssi_txt = f"{rssi}dBm" if isinstance(rssi, int) else "—"
             lq_txt = f"{q}% {bar}" if q is not None else "—"
-            rows.append((call, last_txt, rssi_txt, lq_txt, age_s if "age_s" in locals() else 10**9))
+            rows.append((call, last_txt, rssi_txt, lq_txt, age_s))
 
-        # sort: most recently seen first (smallest age)
         rows.sort(key=lambda x: x[4])
 
-        # Update treeview in-place by call as iid
         existing = set(tv.get_children(""))
         wanted = set()
 
@@ -577,7 +592,6 @@ def start_control_window(args):
             else:
                 tv.insert("", "end", iid=iid, values=(call, last_txt, rssi_txt, lq_txt))
 
-        # Remove nodes no longer present
         for iid in existing - wanted:
             try:
                 tv.delete(iid)
@@ -598,16 +612,14 @@ def start_control_window(args):
             sent_ts = S.auto_last_sent_ts
             sent_pl = S.auto_last_sent_payload
             lrssi = S.last_rssi
-            nodes_snapshot = dict(S.nodes)  # shallow copy
+            nodes_snapshot = dict(S.nodes)
 
-        # Update link quality label
         q, bar = rssi_to_quality(lrssi)
         if q is None:
             lblLink.config(text="LQ=—  RSSI=—")
         else:
             lblLink.config(text=f"LQ={q}% {bar}  RSSI={lrssi}dBm")
 
-        # Update node list
         try:
             refresh_nodes_table(nodes_snapshot)
         except Exception:

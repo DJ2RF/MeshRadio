@@ -1,6 +1,46 @@
-// ============================================================================
-// MeshRadio main
-// ============================================================================
+/******************************************************************************
+ *  MeshRadio Project
+ *
+ *  FILE: <filename>
+ *
+ *  DESCRIPTION
+ *  ---------------------------------------------------------------------------
+ *  MeshRadio main – ESP-IDF v5.5.2
+ *
+ *  AUTHOR
+ *  ---------------------------------------------------------------------------
+ *  Friedrich Riedhammer (Fritz)
+ *  https://nerdverlag.com
+ *  fritz@nerdverlag.com
+ *
+ *  COPYRIGHT
+ *  ---------------------------------------------------------------------------
+ *  (c) 2026 Friedrich Riedhammer / Nerd-Verlag
+ *
+ *  This software is provided "as is", without any express or implied warranty.
+ *  In no event will the author be held liable for any damages arising from
+ *  the use of this software.
+ *
+ *  Permission is granted to use, modify, and distribute this software for
+ *  educational, experimental, and amateur radio purposes, provided that this
+ *  copyright notice and this disclaimer remain intact in all copies.
+ *
+ *  This software is intended for experimentation and research in wireless
+ *  mesh networking. The author does not guarantee correctness, reliability,
+ *  or suitability for any specific purpose.
+ *
+ *  Use at your own risk.
+ *
+ ******************************************************************************/
+
+#include "incl/config_meshradio.h"
+#include "incl/board_pins.h"
+#include "incl/radio_config.h"
+#include "incl/mr_proto_v7.h"
+#include "incl/mr_call7.h"
+#include "incl/mr_bucket.h"
+#include "incl/mr_sec_ccm.h"
+
 
 #include <stdio.h>
 #include <string.h>
@@ -8,10 +48,6 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <ctype.h>
-
-#include "incl/config_meshradio.h"
-#include "incl/board_pins.h"
-#include "incl/radio_config.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -100,52 +136,6 @@ static const char* node_mode_str(node_mode_t m)
 // ============================================================================
 // ================================ HEADER ====================================
 // ============================================================================
-#pragma pack(push,1)
-typedef struct {
-    uint8_t magic[2];
-    uint8_t version;
-    uint8_t flags;
-
-    uint8_t ttl;
-    uint16_t msg_id;
-
-    uint16_t seq;
-
-    char src[7];
-    char final_dst[7];
-    char next_hop[7];
-    char last_hop[7];
-
-    uint8_t payload_len;
-} mr_hdr_v7_t;
-#pragma pack(pop)
-
-// FIXED AAD für CCM (stabil, unabhängig von forwarding Feldern)
-#pragma pack(push,1)
-typedef struct {
-    uint8_t magic[2];
-    uint8_t version;
-    uint8_t flags;
-    uint16_t msg_id;
-    uint16_t seq;
-    char src[7];
-    char final_dst[7];
-    uint8_t payload_len;
-} mr_aad_v7_t;
-#pragma pack(pop)
-
-static void sec_make_aad(mr_aad_v7_t *a, const mr_hdr_v7_t *h)
-{
-    memcpy(a->magic, h->magic, 2);
-    a->version = h->version;
-    a->flags   = h->flags;
-    a->msg_id  = h->msg_id;
-    a->seq     = h->seq;
-    memcpy(a->src, h->src, 7);
-    memcpy(a->final_dst, h->final_dst, 7);
-    a->payload_len = h->payload_len;
-}
-
 
 // ============================================================================
 // ================================ STRUCTS ===================================
@@ -184,14 +174,8 @@ typedef struct {
 } pending_ack_t;
 
 typedef struct {
-    float tokens;
-    float tps;
-    float burst;
-    uint32_t last_ms;
-} bucket_t;
-
-typedef struct {
     bool used;
+    bool has_seq;
     char src[7];
     uint16_t last_seq;
     uint32_t t_ms;
@@ -202,6 +186,18 @@ typedef struct {
 // ================================ GLOBALS ===================================
 // ============================================================================
 static const char *TAG="MR34";
+
+#include "incl/mr_cfg.h"
+
+int8_t g_relay_gpio_runtime = RELAY_GPIO;
+
+char g_callsign_rt[8] = MR_CALLSIGN;
+char g_relay_callsign_rt[8] = MR_RELAY_CALLSIGN;
+
+
+// runtime RF (statt nur DEFAULT_RF_FREQ_HZ Makro)
+uint32_t g_rf_freq_hz_runtime = DEFAULT_RF_FREQ_HZ;
+int8_t   g_tx_power_dbm_runtime = 2;
 
 #if MR_BME280_ENABLE
 static i2c_master_bus_handle_t g_i2c_bus = NULL;
@@ -238,7 +234,7 @@ static SemaphoreHandle_t g_mutex;          // schützt RAM-Tabellen/Globals
 static SemaphoreHandle_t g_lora_spi_mutex; // schützt LoRa SPI-Zugriffe (beide Chips)
 
 static httpd_handle_t g_http=NULL;
-static bool g_http_running=false;
+bool g_http_running=false;
 
 static seen_t seen_cache[SEEN_CACHE_SIZE];
 static neighbor_t neighbors[MAX_NEIGHBORS];
@@ -246,25 +242,27 @@ static route_t routes[MAX_ROUTES];
 static pending_ack_t pend[MAX_PENDING_ACK];
 static replay_t replay_tab[MAX_REPLAY];
 
-static bool g_bc_fallback=true;
-static bool g_beacon_enabled=true;
-static bool g_routeadv_enable=DEFAULT_ROUTEADV_ENABLE;
-static bool g_cad_enable=DEFAULT_CAD_ENABLE;
+bool g_bc_fallback=true;
+bool g_beacon_enabled=true;
+bool g_routeadv_enable=DEFAULT_ROUTEADV_ENABLE;
+bool g_cad_enable=DEFAULT_CAD_ENABLE;
+bool g_powersave_enable = false;
+bool g_bme280_enable = false;
 
-static node_mode_t g_node_mode = (node_mode_t)DEFAULT_NODE_MODE;
+node_mode_t g_node_mode = (node_mode_t)DEFAULT_NODE_MODE;
 
-static bool g_crypto_enable=DEFAULT_CRYPTO_ENABLE;
-static uint8_t g_net_key[SEC_KEY_LEN];
+bool g_crypto_enable=DEFAULT_CRYPTO_ENABLE;
+uint8_t g_net_key[SEC_KEY_LEN];
 
 static uint32_t sec_decrypt_ok=0;
 static uint32_t sec_decrypt_fail=0;
 static uint32_t sec_mac_fail=0;
 static uint32_t sec_replay_drop=0;
 
-static uint32_t g_beacon_interval_ms=DEFAULT_BEACON_INTERVAL_MS;
-static uint8_t  g_routeadv_topn=DEFAULT_ROUTEADV_TOPN;
-static uint16_t g_routeadv_delta_etx=DEFAULT_ROUTEADV_DELTA_ETX;
-static uint32_t g_holddown_ms=DEFAULT_HOLDDOWN_MS;
+uint32_t g_beacon_interval_ms=DEFAULT_BEACON_INTERVAL_MS;
+uint8_t  g_routeadv_topn=DEFAULT_ROUTEADV_TOPN;
+uint16_t g_routeadv_delta_etx=DEFAULT_ROUTEADV_DELTA_ETX;
+uint32_t g_holddown_ms=DEFAULT_HOLDDOWN_MS;
 
 static uint32_t g_next_beacon_ms=0;
 static uint32_t g_next_routeadv_ms=0;
@@ -299,52 +297,142 @@ static uint32_t g_next_batt_ms=0;
 // ============================================================================
 // ================================ HELPERS ===================================
 // ============================================================================
-static uint32_t now_ms(void){ return xTaskGetTickCount()*portTICK_PERIOD_MS; }
+uint32_t now_ms(void){ return xTaskGetTickCount()*portTICK_PERIOD_MS; }
+
+/*static const char *cfg_board_str(void)
+{
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+    return "HELTEC_V3";
+#elif (MR_BOARD_PRESET == MR_BOARD_LILYGO_SX1276)
+    return "LILYGO_SX1276";
+#else
+    return "UNKNOWN";
+#endif
+}
+
+static const char *cfg_lora_chip_str(void)
+{
+#if defined(MR_LORA_CHIP_SX1262)
+    return "SX1262";
+#elif defined(MR_LORA_CHIP_SX1276)
+    return "SX1276";
+#else
+    return "UNKNOWN";
+#endif
+}
+*/
+static const char *cfg_board_str(void)
+{
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+    return "HELTEC_V3";
+#elif (MR_BOARD_PRESET == MR_BOARD_LILYGO_SX1276)
+    return "LILYGO_SX1276";
+#else
+    return "UNKNOWN";
+#endif
+}
+
+static const char *cfg_lora_chip_str(void)
+{
+#if defined(MR_LORA_CHIP_SX1262)
+    return "SX1262";
+#elif defined(MR_LORA_CHIP_SX1276)
+    return "SX1276";
+#else
+    return "UNKNOWN";
+#endif
+}
+
+static void config_print(void)
+{
+    ESP_LOGI(TAG, "CFG: board=%s chip=%s callsign=%s relay_call=%s",
+             cfg_board_str(),
+             cfg_lora_chip_str(),
+             g_callsign_rt,
+             g_relay_callsign_rt);
+
+    ESP_LOGI(TAG, "CFG: rf=%lu tx_dbm=%d net_id=0x%02X crypto=%u wifi=%u role=%s powersave=%u",
+             (unsigned long)g_rf_freq_hz_runtime,
+             (int)g_tx_power_dbm_runtime,
+             (unsigned)MR_NET_ID,
+             g_crypto_enable ? 1 : 0,
+             g_wifi_enabled ? 1 : 0,
+             node_mode_str(g_node_mode),
+             g_cfg.powersave_enable ? 1 : 0);
+
+    ESP_LOGI(TAG, "CFG: relay_en=%u relay_gpio=%d batt_en=%u bme280=%u cli=%u",
+             (unsigned)MR_RELAY_ENABLE,
+             (int)g_relay_gpio_runtime,
+             (unsigned)MR_BATT_ENABLE,
+             (unsigned)MR_BME280_ENABLE,
+             (unsigned)MR_CLI_ENABLE);
+
+    ESP_LOGI(TAG, "CFG: ssid=%s beacon=%lu routeadv=%u topn=%u delta=%u hold=%lu cad=%u",
+             g_cfg.wifi_ssid,
+             (unsigned long)g_beacon_interval_ms,
+             g_routeadv_enable ? 1 : 0,
+             (unsigned)g_routeadv_topn,
+             (unsigned)g_routeadv_delta_etx,
+             (unsigned long)g_holddown_ms,
+             g_cad_enable ? 1 : 0);
+}
+
+static void pending_clear_all_locked(void)
+{
+    memset(pend, 0, sizeof(pend));
+}
+
+static uint16_t mr_next_msg_id(void)
+{
+    if(rtc_msg_id == 0){
+        rtc_msg_id = (uint16_t)(esp_random() & 0xFFFF);
+        if(rtc_msg_id == 0) rtc_msg_id = 1;
+    }
+
+    uint16_t id = rtc_msg_id++;
+    if(rtc_msg_id == 0) rtc_msg_id = 1;   // 0 vermeiden
+    g_msg_id = rtc_msg_id;                // Runtime spiegeln
+    return id;
+}
+
+static uint16_t mr_next_seq(void)
+{
+    if(rtc_seq == 0){
+        rtc_seq = (uint16_t)(esp_random() & 0xFFFF);
+        if(rtc_seq == 0) rtc_seq = 1;
+    }
+
+    uint16_t seq = rtc_seq++;
+    if(rtc_seq == 0) rtc_seq = 1;         // 0 vermeiden
+    g_my_seq = rtc_seq;                   // Runtime spiegeln
+    return seq;
+}
 
 static void mr_init_msg_seq_from_rtc(void)
 {
     rtc_boots++;
 
-    // Wenn RTC noch leer ist (z.B. nach Power-Off), einmal initial seed setzen
-    if(rtc_msg_id == 0) rtc_msg_id = (uint16_t)(esp_random() & 0xFFFF);
-    if(rtc_seq    == 0) rtc_seq    = (uint16_t)(esp_random() & 0xFFFF);
+    if(rtc_msg_id == 0){
+        rtc_msg_id = (uint16_t)(esp_random() & 0xFFFF);
+        if(rtc_msg_id == 0) rtc_msg_id = 1;
+    }
 
-    if(rtc_msg_id == 0) rtc_msg_id = 1;
-    if(rtc_seq    == 0) rtc_seq    = 1;
+    if(rtc_seq == 0){
+        rtc_seq = (uint16_t)(esp_random() & 0xFFFF);
+        if(rtc_seq == 0) rtc_seq = 1;
+    }
 
-    // Runtime-Variablen aus RTC übernehmen (und RTC direkt inkrementieren)
-    g_msg_id = rtc_msg_id++;
-    g_my_seq = rtc_seq++;
+    g_msg_id = rtc_msg_id;
+    g_my_seq = rtc_seq;
 
-    ESP_LOGI(TAG, "RTC init: boots=%" PRIu32 " g_msg_id=%u g_seq=%u",
-             rtc_boots, (unsigned)g_msg_id, (unsigned)g_my_seq);
+    ESP_LOGI(TAG, "RTC init: boots=%" PRIu32 " next_msg_id=%u next_seq=%u",
+             rtc_boots,
+             (unsigned)g_msg_id,
+             (unsigned)g_my_seq);
 }
 
 static inline void lora_spi_lock(void){ xSemaphoreTake(g_lora_spi_mutex, portMAX_DELAY); }
 static inline void lora_spi_unlock(void){ xSemaphoreGive(g_lora_spi_mutex); }
-
-static void call7_set(char o[7], const char *s)
-{
-    memset(o,' ',7);
-    size_t n=strlen(s); if(n>7)n=7;
-    memcpy(o,s,n);
-}
-
-static void call7_to_str(char o[8], const char i[7])
-{
-    memcpy(o,i,7); o[7]=0;
-    for(int k=6;k>=0;k--){
-        if(o[k]==' ') o[k]=0; else break;
-    }
-}
-
-static bool call7_eq(const char a[7], const char b[7]){ return memcmp(a,b,7)==0; }
-
-static bool call7_is_wild(const char a[7])
-{
-    return (a[0]=='*' && a[1]==' ' && a[2]==' ' && a[3]==' ' &&
-            a[4]==' ' && a[5]==' ' && a[6]==' ');
-}
 
 static uint16_t etx_compute_x100(uint32_t tx, uint32_t ack)
 {
@@ -630,32 +718,6 @@ static bool bme280_read_weather(int32_t *out_t_x100, uint32_t *out_p_pa, uint32_
 }
 #endif
 
-// ============================================================================
-// ============================== TOKEN BUCKET ================================
-// ============================================================================
-static void bucket_init(bucket_t *b, float tps, float burst)
-{
-    b->tps=tps;
-    b->burst=burst;
-    b->tokens=burst;
-    b->last_ms=now_ms();
-}
-static void bucket_refill(bucket_t *b)
-{
-    uint32_t t=now_ms();
-    uint32_t dt = t - b->last_ms;
-    b->last_ms=t;
-    float add = (dt/1000.0f) * b->tps;
-    b->tokens += add;
-    if(b->tokens > b->burst) b->tokens = b->burst;
-}
-static bool bucket_take(bucket_t *b)
-{
-    bucket_refill(b);
-    if(b->tokens >= 1.0f){ b->tokens -= 1.0f; return true; }
-    return false;
-}
-
 
 // ============================================================================
 // ================================ SEEN ======================================
@@ -761,7 +823,7 @@ static void route_update_locked(const char dst[7],
                                 uint16_t etx_x100,
                                 int last_rssi)
 {
-    char me[7]; call7_set(me, MR_CALLSIGN);
+    char me[7]; call7_set(me, g_callsign_rt);
     if(call7_eq(next, me)) return;
 
     uint32_t t=now_ms();
@@ -842,10 +904,11 @@ static replay_t* replay_get_locked(const char src[7])
     }
     for(int i=0;i<MAX_REPLAY;i++){
         if(!replay_tab[i].used){
-            replay_tab[i].used=true;
+            replay_tab[i].used = true;
+            replay_tab[i].has_seq = false;
             memcpy(replay_tab[i].src, src, 7);
-            replay_tab[i].last_seq=0;
-            replay_tab[i].t_ms=now_ms();
+            replay_tab[i].last_seq = 0;
+            replay_tab[i].t_ms = now_ms();
             return &replay_tab[i];
         }
     }
@@ -855,10 +918,11 @@ static replay_t* replay_get_locked(const char src[7])
         if(!replay_tab[i].used){ oldest=i; break; }
         if(replay_tab[i].t_ms < ot){ oldest=i; ot=replay_tab[i].t_ms; }
     }
-    replay_tab[oldest].used=true;
+    replay_tab[oldest].used = true;
+    replay_tab[oldest].has_seq = false;
     memcpy(replay_tab[oldest].src, src, 7);
-    replay_tab[oldest].last_seq=0;
-    replay_tab[oldest].t_ms=now_ms();
+    replay_tab[oldest].last_seq = 0;
+    replay_tab[oldest].t_ms = now_ms();
     return &replay_tab[oldest];
 }
 static bool seq_is_newer_u16(uint16_t seq, uint16_t last_seq)
@@ -869,111 +933,21 @@ static bool replay_check_locked(const char src[7], uint16_t seq)
 {
     replay_t *r = replay_get_locked(src);
     r->t_ms = now_ms();
+
+    // Erster SEC-Frame dieses Senders: immer akzeptieren
+    if(!r->has_seq){
+        return true;
+    }
+
     return seq_is_newer_u16(seq, r->last_seq);
 }
 static void replay_update_locked(const char src[7], uint16_t seq)
 {
     replay_t *r = replay_get_locked(src);
     r->last_seq = seq;
+    r->has_seq = true;
     r->t_ms = now_ms();
 }
-
-
-// ============================================================================
-// ============================== CCM (AES-CCM) ===============================
-// ============================================================================
-static void sec_make_nonce(uint8_t nonce[SEC_NONCE_LEN], const mr_hdr_v7_t *h)
-{
-    memcpy(nonce, h->src, 7);
-    nonce[7]  = (uint8_t)(h->seq & 0xFF);
-    nonce[8]  = (uint8_t)(h->seq >> 8);
-    nonce[9]  = (uint8_t)(h->msg_id & 0xFF);
-    nonce[10] = (uint8_t)(h->msg_id >> 8);
-    nonce[11] = (uint8_t)MR_NET_ID;
-}
-static bool sec_encrypt_payload(const mr_hdr_v7_t *h,
-                                const uint8_t *plain, size_t plain_len,
-                                uint8_t *out_cipher, uint8_t out_tag[SEC_TAG_LEN])
-{
-    uint8_t nonce[SEC_NONCE_LEN];
-    sec_make_nonce(nonce, h);
-
-    mbedtls_ccm_context ctx;
-    mbedtls_ccm_init(&ctx);
-
-    if(mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, g_net_key, SEC_KEY_LEN*8) != 0){
-        mbedtls_ccm_free(&ctx);
-        return false;
-    }
-
-    mr_aad_v7_t aad;
-    sec_make_aad(&aad, h);
-
-    int rc = mbedtls_ccm_encrypt_and_tag(
-        &ctx, plain_len,
-        nonce, SEC_NONCE_LEN,
-        (const uint8_t*)&aad, sizeof(aad),
-        plain, out_cipher,
-        out_tag, SEC_TAG_LEN
-    );
-
-    mbedtls_ccm_free(&ctx);
-    return (rc == 0);
-}
-static bool sec_decrypt_payload(const mr_hdr_v7_t *h,
-                                const uint8_t *cipher, size_t cipher_len,
-                                const uint8_t tag[SEC_TAG_LEN],
-                                uint8_t *out_plain)
-{
-    uint8_t nonce[SEC_NONCE_LEN];
-    sec_make_nonce(nonce, h);
-
-    mbedtls_ccm_context ctx;
-    mbedtls_ccm_init(&ctx);
-
-    if(mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, g_net_key, SEC_KEY_LEN*8) != 0){
-        mbedtls_ccm_free(&ctx);
-        return false;
-    }
-
-    mr_aad_v7_t aad;
-    sec_make_aad(&aad, h);
-
-    int rc = mbedtls_ccm_auth_decrypt(
-        &ctx, cipher_len,
-        nonce, SEC_NONCE_LEN,
-        (const uint8_t*)&aad, sizeof(aad),
-        cipher, out_plain,
-        tag, SEC_TAG_LEN
-    );
-
-    mbedtls_ccm_free(&ctx);
-    return (rc == 0);
-}
-
-
-// ============================================================================
-// ============================ KEY PARSE (HEX16) =============================
-// ============================================================================
-static int hexval(char c)
-{
-    if(c>='0'&&c<='9') return c-'0';
-    if(c>='a'&&c<='f') return 10+(c-'a');
-    if(c>='A'&&c<='F') return 10+(c-'A');
-    return -1;
-}
-static bool parse_key_hex16(const char *hex, uint8_t out[SEC_KEY_LEN])
-{
-    if(strlen(hex) < 32) return false;
-    for(int i=0;i<SEC_KEY_LEN;i++){
-        int hi=hexval(hex[2*i]);
-        int lo=hexval(hex[2*i+1]);
-        if(hi<0||lo<0) return false;
-        out[i] = (uint8_t)((hi<<4)|lo);
-    }
-    return true;
-}
-
 
 // ============================================================================
 // ================================ SPI INIT ==================================
@@ -1076,7 +1050,8 @@ static void lora_init_radio(void)
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // 863.000 MHz / SF7 / BW125 / CR4/5 / CRC on
-    uint32_t frf=hz_to_frf(DEFAULT_RF_FREQ_HZ);
+    // uint32_t frf=hz_to_frf(DEFAULT_RF_FREQ_HZ);
+    uint32_t frf=hz_to_frf(g_rf_freq_hz_runtime);
     sx1276_wr(SX1276_REG_FRF_MSB, frf>>16);
     sx1276_wr(SX1276_REG_FRF_MID, frf>>8);
     sx1276_wr(SX1276_REG_FRF_LSB, frf);
@@ -1085,7 +1060,10 @@ static void lora_init_radio(void)
     sx1276_wr(SX1276_REG_MODEM_CONFIG_2, (7<<4)|(1<<2)|0x03);
     sx1276_wr(SX1276_REG_MODEM_CONFIG_3, 0x04);
 
-    sx1276_wr(SX1276_REG_PA_CONFIG, 0x8E);
+    int8_t p = g_tx_power_dbm_runtime;
+    if(p < 2) p = 2;
+    if(p > 17) p = 17;
+    sx1276_wr(SX1276_REG_PA_CONFIG, (uint8_t)(0x80 | (p - 2)));
 
     sx1276_wr(SX1276_REG_FIFO_RX_BASE_ADDR, 0);
     sx1276_wr(SX1276_REG_FIFO_ADDR_PTR, 0);
@@ -1096,14 +1074,14 @@ static void lora_init_radio(void)
     lora_spi_unlock();
 }
 
-static void lora_set_rx_continuous(void)
+void lora_set_rx_continuous(void)
 {
     lora_spi_lock();
     sx1276_wr(SX1276_REG_OP_MODE, 0x85);
     lora_spi_unlock();
 }
 
-static void lora_recover_radio(void)
+void lora_recover_radio(void)
 {
     ESP_LOGE(TAG, "LoRa recover (SX1276)");
     lora_init_radio();
@@ -1374,15 +1352,32 @@ static void lora_init_radio(void)
     // PA config (Heltec example)
     { uint8_t pa[5] = { SX126X_SET_PA_CONFIG, 0x04, 0x07, 0x00, 0x01 }; sx126x_cmd(pa, sizeof(pa)); }
 
-    // TxParams: 14 dBm + 200us ramp (safe default)  Hier Leistung auf 2DBm reduziert
-    { uint8_t txp[3] = { SX126X_SET_TX_PARAMS, 0x02, 0x04 }; sx126x_cmd(txp, sizeof(txp)); }
+    // TxParams runtime from config + 200us ramp 
+    {
+    int8_t p = g_tx_power_dbm_runtime;
+    if(p < -9) p = -9;
+    if(p > 22) p = 22;
 
-    // RF frequency: DEFAULT_RF_FREQ_HZ (bei dir 863 MHz)
-    uint32_t rf = (uint32_t)(((uint64_t)DEFAULT_RF_FREQ_HZ << 25) / 32000000ULL);
+        uint8_t txp[3] = {
+            SX126X_SET_TX_PARAMS,
+            (uint8_t)p,
+            0x04
+        };
+    sx126x_cmd(txp, sizeof(txp));
+    }
+
+    // RF frequency:
+    ESP_LOGW(TAG, "SX1262 init RF=%lu Hz TX=%d dBm",
+         (unsigned long)g_rf_freq_hz_runtime,
+         (int)g_tx_power_dbm_runtime);
+
+    uint32_t rf = (uint32_t)(((uint64_t)g_rf_freq_hz_runtime << 25) / 32000000ULL);
     uint8_t rfcmd[5] = {
         SX126X_SET_RF_FREQUENCY,
-        (uint8_t)(rf >> 24), (uint8_t)(rf >> 16),
-        (uint8_t)(rf >> 8),  (uint8_t)(rf)
+        (uint8_t)(rf >> 24),
+        (uint8_t)(rf >> 16),
+        (uint8_t)(rf >> 8),
+        (uint8_t)(rf)
     };
     sx126x_cmd(rfcmd, sizeof(rfcmd));
 
@@ -1414,7 +1409,7 @@ static void lora_init_radio(void)
     lora_spi_unlock();
 }
 
-static void lora_set_rx_continuous(void)
+void lora_set_rx_continuous(void)
 {
     lora_spi_lock();
     uint8_t rx[4] = { SX126X_SET_RX, 0xFF, 0xFF, 0xFF };
@@ -1422,7 +1417,7 @@ static void lora_set_rx_continuous(void)
     lora_spi_unlock();
 }
 
-static void lora_recover_radio(void)
+void lora_recover_radio(void)
 {
     ESP_LOGE(TAG, "LoRa recover (SX1262): re-init");
     lora_init_radio();
@@ -1581,28 +1576,28 @@ static void lora_log_chip_info(void)
 // =============================== Relay (GPIO) ===============================
 // ============================================================================
 #if MR_RELAY_ENABLE
-static void relay_init(void)
+void relay_init(void)
 {
     gpio_config_t io = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << RELAY_GPIO),
+        .pin_bit_mask = (1ULL << g_relay_gpio_runtime),
         .pull_down_en = 0,
         .pull_up_en = 0
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
     // HOLD sicher aus, sonst kannst du initial nicht setzen
-    gpio_hold_dis((gpio_num_t)RELAY_GPIO);
+    gpio_hold_dis((gpio_num_t)g_relay_gpio_runtime);
 
     bool on = (rtc_relay_state != 0);
     int level = on ? (RELAY_ACTIVE_LEVEL ? 1 : 0)
                    : (RELAY_ACTIVE_LEVEL ? 0 : 1);
-    gpio_set_level((gpio_num_t)RELAY_GPIO, level);
+    gpio_set_level((gpio_num_t)g_relay_gpio_runtime, level);
     g_relay_on = on;
 
     // optional: gleich wieder halten (Reset-Schutz)
-    gpio_hold_en((gpio_num_t)RELAY_GPIO);
+    gpio_hold_en((gpio_num_t)g_relay_gpio_runtime);
 }
 
 static void relay_set(bool on)
@@ -1610,15 +1605,15 @@ static void relay_set(bool on)
     rtc_relay_state = on ? 1 : 0;   // <- merkt sich über Deep Sleep
 
     // falls hold aktiv war: kurz lösen, ändern, dann (optional) wieder halten
-    gpio_hold_dis((gpio_num_t)RELAY_GPIO);
+    gpio_hold_dis((gpio_num_t)g_relay_gpio_runtime);
 
     g_relay_on = on;
     int level = on ? (RELAY_ACTIVE_LEVEL ? 1 : 0)
                    : (RELAY_ACTIVE_LEVEL ? 0 : 1);
-    gpio_set_level((gpio_num_t)RELAY_GPIO, level);
+    gpio_set_level((gpio_num_t)g_relay_gpio_runtime, level);
 
     // optional: hält auch über Reset-Events (WDT etc.)
-    gpio_hold_en((gpio_num_t)RELAY_GPIO);
+    gpio_hold_en((gpio_num_t)g_relay_gpio_runtime);
 }
 
 static void relay_toggle(void){ relay_set(!g_relay_on); }
@@ -1803,7 +1798,7 @@ static void batt_force_read_once(void)
 #else
     gpio_set_level(BATT_EN_GPIO, 1);
 #endif
-    vTaskDelay(pdMS_TO_TICKS(4));
+    vTaskDelay(pdMS_TO_TICKS(20));
 #endif
 
     adc_unit_t unit;
@@ -1829,7 +1824,14 @@ static void batt_force_read_once(void)
     }
 
     float scale = (BATT_DIV_RTOP_OHMS + BATT_DIV_RBOT_OHMS) / BATT_DIV_RBOT_OHMS;
-    uint32_t vbat = (uint32_t)((float)mv_adc * scale);
+    uint32_t vbat = (uint32_t)((float)mv_adc * scale * BATT_CAL_FACTOR);
+
+    ESP_LOGW(TAG, "BATT DBG raw=%d mv_adc=%d scale=%.3f cal=%.3f vbat=%lu",
+         raw,
+         mv_adc,
+         (double)scale,
+         (double)BATT_CAL_FACTOR,
+         (unsigned long)vbat);
 
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_batt_mv  = vbat;
@@ -1862,7 +1864,7 @@ static void batt_poll(void)
 #else
     gpio_set_level(BATT_EN_GPIO, 1);
 #endif
-    vTaskDelay(pdMS_TO_TICKS(4));             // settle time (3–5ms)
+    vTaskDelay(pdMS_TO_TICKS(20));             // settle time (3–5ms)
 #endif
 
     // Resolve ADC channel from GPIO (works on ESP32 + ESP32-S3)
@@ -1912,13 +1914,20 @@ static void batt_poll(void)
             mv_adc = 0;
         }
     }else{
-        // rough fallback (calibration recommended)
-        mv_adc = (raw * 3300) / 4095;
+    // rough fallback (calibration recommended)
+    mv_adc = (raw * 3300) / 4095;
     }
 
     float scale = (BATT_DIV_RTOP_OHMS + BATT_DIV_RBOT_OHMS) / BATT_DIV_RBOT_OHMS;
-    uint32_t vbat = (uint32_t)((float)mv_adc * scale);
+    uint32_t vbat = (uint32_t)((float)mv_adc * scale * BATT_CAL_FACTOR);
 
+    /*ESP_LOGW(TAG, "BATT DBG poll raw=%d mv_adc=%d scale=%.3f cal=%.3f vbat=%lu",
+         raw,
+         mv_adc,
+         (double)scale,
+         (double)BATT_CAL_FACTOR,
+         (unsigned long)vbat);
+    */
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_batt_mv  = vbat;
     g_batt_pct = batt_mv_to_pct(vbat);
@@ -1990,15 +1999,22 @@ static void wifi_init_once(void)
 
     esp_netif_create_default_wifi_ap();
 
-    wifi_init_config_t cfg=WIFI_INIT_CONFIG_DEFAULT();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    wifi_config_t ap={0};
-    strcpy((char*)ap.ap.ssid, MR_WIFI_AP_SSID);
-    ap.ap.max_connection=4;
+    wifi_config_t ap = {0};
 
-    if(strlen(MR_WIFI_AP_PASS) >= 8){
-        strcpy((char*)ap.ap.password, MR_WIFI_AP_PASS);
+    strncpy((char*)ap.ap.ssid, g_cfg.wifi_ssid, sizeof(ap.ap.ssid)-1);
+    ap.ap.ssid[sizeof(ap.ap.ssid)-1] = 0;
+    ap.ap.ssid_len = 0;
+    ap.ap.channel = 1;
+    ap.ap.max_connection = 8;   // <--- HIER
+    ap.ap.ssid_hidden = 0;
+    ap.ap.beacon_interval = 100;
+
+    if(strlen(g_cfg.wifi_pass) >= 8){
+        strncpy((char*)ap.ap.password, g_cfg.wifi_pass, sizeof(ap.ap.password)-1);
+        ap.ap.password[sizeof(ap.ap.password)-1] = 0;
         ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     }else{
         ap.ap.authmode = WIFI_AUTH_OPEN;
@@ -2006,9 +2022,9 @@ static void wifi_init_once(void)
     }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP,&ap));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
 
-    g_wifi_inited=true;
+    g_wifi_inited = true;
 }
 
 static void wifi_start_ap(void)
@@ -2037,7 +2053,7 @@ static void http_stop(void)
 
 static void http_start_if_needed(void); // forward
 
-static void set_wifi_enabled(bool en)
+void set_wifi_enabled(bool en)
 {
     if(en == g_wifi_enabled) return;
     g_wifi_enabled=en;
@@ -2055,6 +2071,150 @@ static void set_wifi_enabled(bool en)
 // ============================================================================
 // =============================== HTTP helpers ===============================
 // ============================================================================
+
+// --- forward declarations for HTTP helpers (must be before api_cfg_* uses them) ---
+static esp_err_t http_send_text(httpd_req_t *req, const char *txt);
+static bool http_read_body(httpd_req_t *req, char *buf, size_t buf_sz);
+static bool form_get(char *body,const char *key,char *out,size_t out_sz);
+
+static void delayed_factory_reset_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(800));
+    ESP_LOGW(TAG, "Factory reset requested -> erasing NVS and restarting");
+
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    esp_restart();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t api_cfg_erase_post(httpd_req_t *req)
+{
+    http_send_text(req, "OK factory reset");
+
+    BaseType_t ok = xTaskCreate(
+        delayed_factory_reset_task,
+        "factory_reset_task",
+        3072,
+        NULL,
+        5,
+        NULL
+    );
+
+    if(ok != pdPASS){
+        ESP_LOGE(TAG, "Failed to create factory reset task");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+
+static void delayed_reset_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(800));
+    ESP_LOGW(TAG, "HTTP reset requested -> restarting now");
+    esp_restart();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t api_reset_post(httpd_req_t *req)
+{
+    http_send_text(req, "OK reset");
+
+    BaseType_t ok = xTaskCreate(
+        delayed_reset_task,
+        "reset_task",
+        2048,
+        NULL,
+        5,
+        NULL
+    );
+
+    if(ok != pdPASS){
+        ESP_LOGE(TAG, "Failed to create reset task");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t api_cfg_defaults_post(httpd_req_t *req)
+{
+    (void)req;
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    mr_cfg_defaults(&g_cfg);
+    (void)parse_key_hex16(MR_NET_KEY_HEX, g_cfg.net_key); // compile-time default key
+    mr_cfg_apply(&g_cfg);
+    xSemaphoreGive(g_mutex);
+    return http_send_text(req, "OK defaults");
+}
+
+static esp_err_t api_cfg_apply_post(httpd_req_t *req)
+{
+    (void)req;
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    mr_cfg_apply(&g_cfg);
+    xSemaphoreGive(g_mutex);
+    return http_send_text(req, "OK applied");
+}
+
+static esp_err_t api_cfg_get(httpd_req_t *req)
+{
+    static char out[768];
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    mr_cfg_to_json(&g_cfg, out, sizeof(out));
+    xSemaphoreGive(g_mutex);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+
+static esp_err_t api_cfg_post(httpd_req_t *req)
+{
+    char body[512];
+    if(!http_read_body(req, body, sizeof(body))) return http_send_text(req, "ERR body");
+
+    // erwartet: key=<k>&val=<v>  (ein Paar pro Request; robust & simpel)
+    char k[48]={0}, v[160]={0};
+    if(!form_get(body,"key",k,sizeof(k))) return http_send_text(req,"ERR missing key");
+    if(!form_get(body,"val",v,sizeof(v))) return http_send_text(req,"ERR missing val");
+
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    bool ok = mr_cfg_set_kv(&g_cfg, k, v);
+    if(ok){
+        mr_cfg_apply(&g_cfg);
+    }
+    xSemaphoreGive(g_mutex);
+
+    return http_send_text(req, ok ? "OK" : "ERR invalid");
+}
+
+// optional: /api/cfg/save
+static esp_err_t api_cfg_save_post(httpd_req_t *req)
+{
+    (void)req;
+    bool ok=false;
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    ok = mr_cfg_save_nvs(&g_cfg);
+    xSemaphoreGive(g_mutex);
+    return http_send_text(req, ok ? "OK saved" : "ERR save");
+}
+
+// optional: /api/cfg/load
+static esp_err_t api_cfg_load_post(httpd_req_t *req)
+{
+    (void)req;
+    bool ok=false;
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    ok = mr_cfg_load_nvs(&g_cfg);
+    if(ok) mr_cfg_apply(&g_cfg);
+    xSemaphoreGive(g_mutex);
+    return http_send_text(req, ok ? "OK loaded" : "ERR load");
+}
+
 static esp_err_t http_send_text(httpd_req_t *req, const char *txt)
 {
     httpd_resp_set_type(req,"text/plain");
@@ -2132,7 +2292,9 @@ static const char *INDEX_HTML =
 "<style>"
 "body{font-family:system-ui;margin:16px;max-width:1200px}"
 "button{padding:10px 14px;margin:6px 4px;font-size:16px}"
-"input{padding:10px;margin:6px 0;font-size:16px;width:100%}"
+"input:not([type='checkbox']){padding:10px;margin:6px 0;font-size:16px;width:100%;box-sizing:border-box}"
+"input[type='checkbox']{width:16px;height:16px;margin:0;padding:0}"
+"select{padding:10px;margin:6px 0;font-size:16px;width:100%;box-sizing:border-box}"
 ".card{border:1px solid #ddd;border-radius:12px;padding:12px;box-shadow:0 1px 3px rgba(0,0,0,.06);margin:10px 0}"
 ".muted{color:#666}.err{color:#b00020;font-weight:600}.ok{color:#0b7a26;font-weight:600}"
 ".grid{display:grid;grid-template-columns:1fr;gap:12px}"
@@ -2142,15 +2304,25 @@ static const char *INDEX_HTML =
 "th{background:#fafafa}"
 ".pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #ddd;font-size:12px}"
 ".amp{display:inline-block;width:12px;height:12px;border-radius:50%;vertical-align:middle;margin-right:6px;border:1px solid #aaa}"
+".cfg-checks{display:grid;grid-template-columns:1fr;row-gap:10px;margin-bottom:14px}"
+".cfg-checks label{display:grid;grid-template-columns:20px auto;column-gap:10px;align-items:center;justify-content:start;margin:0;white-space:nowrap}"
+".cfg-actions{display:flex;flex-direction:column;gap:10px;margin-top:14px}"
+".cfg-actions-row{display:flex;flex-wrap:wrap;gap:10px}"
+".cfg-actions button{margin:0}"
+".cfg-actions-row button{min-width:140px}"
 "</style></head><body>"
+
 "<h2>MeshRadio Bonus (c) 2026 Nerd-Verlag https://nerdverlag.com – Roles, Security, Relay, WiFi, Dashboard</h2>"
 "<p class='muted'>AP: <code>" MR_WIFI_AP_SSID "</code> • URL: <code>http://192.168.4.1</code></p>"
+
 "<div class='card'>"
 "<div><b><span id='amp' class='amp'></span>UI-Ampel:</b> <span id='ampTxt'>loading…</span> <span class='pill' id='agePill'>?</span></div>"
 "<div><b>Status:</b> <span id='st'>loading…</span></div>"
+"<div><b>Target:</b> <span id='targetinfo'>loading…</span></div>"
 "<div id='err' class='err'></div>"
 "<button onclick='refreshAll()'>Refresh</button>"
 "</div>"
+
 "<div class='grid'>"
 " <div class='card'>"
 "  <h3>DATA senden</h3>"
@@ -2160,6 +2332,7 @@ static const char *INDEX_HTML =
 "  <button onclick='send()'>SEND</button>"
 "  <div id='m' class='muted'></div>"
 " </div>"
+
 " <div class='card'>"
 "  <h3>Node Role</h3>"
 "  <div><b>Mode:</b> <span id='nm' class='ok'>?</span></div>"
@@ -2167,56 +2340,334 @@ static const char *INDEX_HTML =
 "  <button onclick='setRole(1)'>EDGE</button>"
 "  <button onclick='setRole(2)'>SENSOR</button>"
 " </div>"
+
 " <div class='card'>"
 "  <h3>Security</h3>"
 "  <div><b>Crypto:</b> <span id='cst' class='ok'>?</span></div>"
 "  <button onclick='setCrypto(1)'>Crypto ON</button>"
 "  <button onclick='setCrypto(0)'>Crypto OFF</button>"
 " </div>"
+
 " <div class='card'>"
 "  <h3>WiFi / Web UI</h3>"
 "  <button onclick='setWiFi(1)'>WiFi ON</button>"
 "  <button onclick='setWiFi(0)'>WiFi OFF</button>"
 " </div>"
+" <div class='card'>"
+"  <h3>Relay Output</h3>"
+"  <button onclick='setRelay(1)'>Relay ON</button>"
+"  <button onclick='setRelay(0)'>Relay OFF</button>"
+"  <button onclick='toggleRelay()'>Relay TOGGLE</button>"
+" </div>"
 "</div>"
+
 "<div class='card'><h3>Last RX</h3><div id='lastrx'>loading…</div></div>"
 "<div class='card'><h3>Security Stats</h3><pre id='secstats'>loading…</pre></div>"
 "<div class='card'><h3>Counters</h3><pre id='counters'>loading…</pre></div>"
 "<div class='card'><h3>Neighbors</h3><div id='neigh'>loading…</div></div>"
 "<div class='card'><h3>Routes</h3><div id='routes'>loading…</div></div>"
+
+"<div class='card'>"
+"<div style='display:flex;justify-content:space-between;align-items:center'>"
+"  <h3 style='margin:0'>Configuration</h3>"
+"  <a href='https://nerdverlag.com/?page_id=706' target='_blank'>"
+"    <button style='padding:8px 20px;font-size:14px;font-weight:bold;color:#fff;background:#d00000;border:1px solid #900;border-radius:6px'>HELP</button>"
+"  </a>"
+"</div>"
+"  <div class='grid'>"
+"    <div>"
+"      <label>Callsign</label><input id='cfg_callsign'>"
+"      <label>Relay Callsign</label><input id='cfg_relay_callsign'>"
+"      <label>Node Mode</label>"
+"      <select id='cfg_node_mode'>"
+"        <option value='0'>RELAY</option>"
+"        <option value='1'>EDGE</option>"
+"        <option value='2'>SENSOR</option>"
+"      </select>"
+"      <label>RF Frequency (Hz)</label><input id='cfg_rf_hz'>"
+"      <label>TX Power (dBm)</label><input id='cfg_tx_dbm'>"
+"      <label>Beacon Interval (ms)</label><input id='cfg_beacon_ms'>"
+"      <label>Holddown (ms)</label><input id='cfg_holddown_ms'>"
+"    </div>"
+
+"    <div>"
+"      <label>WiFi SSID</label><input id='cfg_ssid'>"
+"      <label>WiFi Password</label><input id='cfg_pass'>"
+"      <label>Net ID</label><input id='cfg_net_id'>"
+"      <label>Net Key (32 hex)</label><input id='cfg_netkey'>"
+"      <label>RouteAdv TopN</label><input id='cfg_routeadv_topn'>"
+"      <label>Relay GPIO</label><input id='cfg_relay_gpio'>"
+"      <label>RouteAdv Delta</label><input id='cfg_routeadv_delta'>"
+"      <label>Sensor Wake (ms)</label><input id='cfg_sensor_wake_ms'>"
+"      <label>Sensor RX Window (ms)</label><input id='cfg_sensor_rxwin_ms'>"
+"    </div>"
+
+"    <div>"
+"      <div class='cfg-checks'>"
+"        <label><input type='checkbox' id='cfg_wifi'><span>WiFi enabled</span></label>"
+"        <label><input type='checkbox' id='cfg_crypto'><span>Crypto enabled</span></label>"
+"        <label><input type='checkbox' id='cfg_beacon'><span>Beacon enabled</span></label>"
+"        <label><input type='checkbox' id='cfg_routeadv'><span>RouteAdv enabled</span></label>"
+"        <label><input type='checkbox' id='cfg_cad'><span>CAD enabled</span></label>"
+"        <label><input type='checkbox' id='cfg_powersave'><span>PowerSave enabled</span></label>"
+"        <label><input type='checkbox' id='cfg_bme280'> BME280 enabled</label><br>"
+"      </div>"
+"      <div class='cfg-actions'>"
+"        <div class='cfg-actions-row'>"
+"          <button onclick='cfgApplyForm()'>Apply Form</button>"
+"          <button onclick='cfgSave()'>Save NVS</button>"
+"        </div>"
+"        <div class='cfg-actions-row'>"
+"          <button onclick='cfgLoad()'>Load NVS</button>"
+"          <button onclick='cfgDefaults()'>Defaults</button>"
+"        </div>"
+"        <div class='cfg-actions-row'>"
+"          <button onclick='cfgRefresh()'>Reload Config</button>"
+"          <button style='background:#b00020;color:#fff;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.18)' onclick='doReset()'>Reset ESP</button>"
+"        </div>"
+"        <div class='cfg-actions-row'>"
+"          <button style='background:#7a0000;color:#fff;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.18)' onclick='cfgErase()'>Factory Reset</button>"
+"        </div>"
+"      </div>"
+"      <div id='cfgmsg' class='muted' style='margin-top:10px'></div>"
+"    </div>"
+"  </div>"
+"</div>"
+
 "<script>"
-"async function post(url,body){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});return await r.text();}"
-"function esc(s){return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}"
-"function setAmp(color,txt,age){let a=document.getElementById('amp');a.style.background=color;document.getElementById('ampTxt').textContent=txt;document.getElementById('agePill').textContent=age;}"
-"async function send(){let dst=document.getElementById('dst').value;let msg=document.getElementById('msg').value;let ack=document.getElementById('ack').value;let t=await post('/api/send','dst='+encodeURIComponent(dst)+'&msg='+encodeURIComponent(msg)+'&ack='+encodeURIComponent(ack));document.getElementById('m').textContent=t; refreshAll();}"
-"async function setCrypto(v){ let t=await post('/api/crypto','enable='+encodeURIComponent(v)); document.getElementById('m').textContent=t; refreshAll(); }"
-"async function setRole(m){ let t=await post('/api/role','mode='+encodeURIComponent(m)); document.getElementById('m').textContent=t; refreshAll(); }"
-"async function setWiFi(v){ let t=await post('/api/wifi','enable='+encodeURIComponent(v)); document.getElementById('m').textContent=t; }"
-"function renderTable(cols, rows){ let h='<table><thead><tr>' + cols.map(c=>'<th>'+esc(c)+'</th>').join('') + '</tr></thead><tbody>'; for(let r of rows){ h+='<tr>' + r.map(v=>'<td>'+esc(String(v))+'</td>').join('') + '</tr>'; } h+='</tbody></table>'; return h; }"
-"async function refreshAll(){"
-" document.getElementById('err').textContent='';"
-" try{"
-"  let j=JSON.parse(await (await fetch('/api/status')).text());"
-"  document.getElementById('st').textContent='call='+j.call+' • mode='+j.node_mode_str+' • wifi='+j.wifi+' • relay='+j.relay+' • crypto='+j.crypto_enable+' • batt='+j.batt;"
-"  document.getElementById('nm').textContent=j.node_mode_str;"
-"  document.getElementById('cst').textContent=(j.crypto_enable==1)?'ON':'OFF';"
-"  document.getElementById('cst').className=(j.crypto_enable==1)?'ok':'err';"
-"  document.getElementById('secstats').textContent=j.secstats;"
-"  document.getElementById('counters').textContent=j.counters;"
-"  let lj=JSON.parse(await (await fetch('/api/lastrx')).text());"
-"  let age=lj.age_ms;"
-"  if(age<0){document.getElementById('lastrx').innerHTML='<span class=muted>No RX yet</span>'; setAmp('#bbb','NO RX','—');}"
-"  else{document.getElementById('lastrx').innerHTML='<b>from</b> <code>'+esc(lj.from)+'</code><br><b>text</b> '+esc(lj.text)+'<br><span class=muted>age_ms='+age+'</span>';"
-"    if(age <= 6000) setAmp('#19a34a','OK (fresh)',age+' ms'); else if(age <= 20000) setAmp('#f59e0b','STALE',age+' ms'); else setAmp('#dc2626','OLD',age+' ms');}"
-"  let nj=JSON.parse(await (await fetch('/api/neighbors')).text());"
-"  let nrows=nj.map(x=>[x.call, x.rssi, x.age_ms, x.tx_attempts, x.ack_ok, x.etx_x100]);"
-"  document.getElementById('neigh').innerHTML = nrows.length ? renderTable(['call','rssi','age_ms','tx','ack','etx_x100'], nrows) : '<span class=muted>none</span>';"
-"  let rj=JSON.parse(await (await fetch('/api/routes')).text());"
-"  let rrows=rj.map(x=>[x.dst, x.next, x.etx_x100, x.seq, x.age_ms, x.hold_ms]);"
-"  document.getElementById('routes').innerHTML = rrows.length ? renderTable(['dst','next','etx_x100','seq','age_ms','hold_ms'], rrows) : '<span class=muted>none</span>';"
-" }catch(e){document.getElementById('st').textContent='ERROR';document.getElementById('err').textContent='Dashboard error: '+e; setAmp('#dc2626','UI ERROR','—');}"
+"async function post(url,body){"
+"  let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''});"
+"  return await r.text();"
 "}"
-"refreshAll(); setInterval(refreshAll, 3000);"
+
+"function esc(s){"
+"  return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');"
+"}"
+
+"function setAmp(color,txt,age){"
+"  let a=document.getElementById('amp');"
+"  a.style.background=color;"
+"  document.getElementById('ampTxt').textContent=txt;"
+"  document.getElementById('agePill').textContent=age;"
+"}"
+
+"function renderTable(cols, rows){"
+"  let h='<table><thead><tr>' + cols.map(c=>'<th>'+esc(c)+'</th>').join('') + '</tr></thead><tbody>';"
+"  for(let r of rows){"
+"    h+='<tr>' + r.map(v=>'<td>'+esc(String(v))+'</td>').join('') + '</tr>';"
+"  }"
+"  h+='</tbody></table>';"
+"  return h;"
+"}"
+
+"async function send(){"
+"  let dst=document.getElementById('dst').value;"
+"  let msg=document.getElementById('msg').value;"
+"  let ack=document.getElementById('ack').value;"
+"  let t=await post('/api/send','dst='+encodeURIComponent(dst)+'&msg='+encodeURIComponent(msg)+'&ack='+encodeURIComponent(ack));"
+"  document.getElementById('m').textContent=t;"
+"  refreshAll();"
+"}"
+
+"async function setCrypto(v){"
+"  let t=await post('/api/crypto','enable='+encodeURIComponent(v));"
+"  document.getElementById('m').textContent=t;"
+"  refreshAll();"
+"}"
+
+"async function setRole(m){"
+"  let t=await post('/api/role','mode='+encodeURIComponent(m));"
+"  document.getElementById('m').textContent=t;"
+"  refreshAll();"
+"}"
+
+"async function setWiFi(v){"
+"  let t=await post('/api/wifi','enable='+encodeURIComponent(v));"
+"  document.getElementById('m').textContent=t;"
+"}"
+
+"async function setRelay(v){"
+"  let t=await post('/api/relay','enable='+encodeURIComponent(v));"
+"  document.getElementById('m').textContent=t;"
+"  refreshAll();"
+"}"
+
+"async function toggleRelay(){"
+"  let t=await post('/api/relay/toggle','');"
+"  document.getElementById('m').textContent=t;"
+"  refreshAll();"
+"}"
+"async function cfgPost(key,val){"
+"  return await post('/api/cfg','key='+encodeURIComponent(key)+'&val='+encodeURIComponent(val));"
+"}"
+
+"function cfgSetMsg(t){"
+"  let el=document.getElementById('cfgmsg');"
+"  if(el) el.textContent=t;"
+"}"
+
+"async function cfgRefresh(){"
+"  try{"
+"    let resp = await fetch('/api/cfg');"
+"    let txt = await resp.text();"
+"    if(!txt.startsWith('{')) throw new Error(txt);"
+"    let c = JSON.parse(txt);"
+"    document.getElementById('cfg_callsign').value=c.callsign||'';"
+"    document.getElementById('cfg_relay_callsign').value=c.relay_callsign||'';"
+"    document.getElementById('cfg_node_mode').value=String(c.node_mode);"
+"    document.getElementById('cfg_rf_hz').value=c.rf_hz;"
+"    document.getElementById('cfg_tx_dbm').value=c.tx_dbm;"
+"    document.getElementById('cfg_beacon_ms').value=c.beacon_ms;"
+"    document.getElementById('cfg_holddown_ms').value=c.holddown_ms;"
+"    document.getElementById('cfg_ssid').value=c.ssid||'';"
+"    document.getElementById('cfg_pass').value='';"
+"    document.getElementById('cfg_net_id').value=c.net_id;"
+"    document.getElementById('cfg_netkey').value='';"
+"    document.getElementById('cfg_relay_gpio').value=c.relay_gpio;"
+"    document.getElementById('cfg_routeadv_topn').value=c.routeadv_topn;"
+"    document.getElementById('cfg_routeadv_delta').value=c.routeadv_delta;"
+"    document.getElementById('cfg_sensor_wake_ms').value=c.sensor_wake_ms;"
+"    document.getElementById('cfg_sensor_rxwin_ms').value=c.sensor_rxwin_ms;"
+"    document.getElementById('cfg_wifi').checked=!!c.wifi;"
+"    document.getElementById('cfg_crypto').checked=!!c.crypto;"
+"    document.getElementById('cfg_beacon').checked=!!c.beacon;"
+"    document.getElementById('cfg_routeadv').checked=!!c.routeadv;"
+"    document.getElementById('cfg_cad').checked=!!c.cad;"
+"    document.getElementById('cfg_powersave').checked=!!c.powersave;"
+"    document.getElementById('cfg_bme280').checked=!!c.bme280;"
+"    cfgSetMsg('Config loaded');"
+"  }catch(e){"
+"    cfgSetMsg('Config load error: '+e);"
+"  }"
+"}"
+
+"async function cfgApplyForm(){"
+"  try{"
+"    let ops=["
+"      ['callsign', document.getElementById('cfg_callsign').value],"
+"      ['relay_callsign', document.getElementById('cfg_relay_callsign').value],"
+"      ['node_mode', document.getElementById('cfg_node_mode').value],"
+"      ['rf_hz', document.getElementById('cfg_rf_hz').value],"
+"      ['tx_dbm', document.getElementById('cfg_tx_dbm').value],"
+"      ['beacon_ms', document.getElementById('cfg_beacon_ms').value],"
+"      ['holddown_ms', document.getElementById('cfg_holddown_ms').value],"
+"      ['ssid', document.getElementById('cfg_ssid').value],"
+"      ['netid', document.getElementById('cfg_net_id').value],"
+"      ['relay_gpio', document.getElementById('cfg_relay_gpio').value],"
+"      ['routeadv_topn', document.getElementById('cfg_routeadv_topn').value],"
+"      ['routeadv_delta', document.getElementById('cfg_routeadv_delta').value],"
+"      ['sensor_wake_ms', document.getElementById('cfg_sensor_wake_ms').value],"
+"      ['sensor_rxwin_ms', document.getElementById('cfg_sensor_rxwin_ms').value],"
+"      ['wifi', document.getElementById('cfg_wifi').checked ? '1' : '0'],"
+"      ['crypto', document.getElementById('cfg_crypto').checked ? '1' : '0'],"
+"      ['beacon', document.getElementById('cfg_beacon').checked ? '1' : '0'],"
+"      ['routeadv', document.getElementById('cfg_routeadv').checked ? '1' : '0'],"
+"      ['cad', document.getElementById('cfg_cad').checked ? '1' : '0'],"
+"      ['powersave', document.getElementById('cfg_powersave').checked ? '1' : '0'],"
+"      ['bme280', document.getElementById('cfg_bme280').checked ? '1':'0'],"
+"    ];"
+
+"    let pass=document.getElementById('cfg_pass').value;"
+"    let netkey=document.getElementById('cfg_netkey').value;"
+"    if(pass.length>0) ops.push(['pass', pass]);"
+"    if(netkey.length>0) ops.push(['netkey', netkey]);"
+
+"    for(let kv of ops){"
+"      let r=await cfgPost(kv[0], kv[1]);"
+"      if(!String(r).startsWith('OK')){"
+"        cfgSetMsg('Error at '+kv[0]+': '+r);"
+"        return;"
+"      }"
+"    }"
+
+"    let ra=await post('/api/cfg/apply','');"
+"    cfgSetMsg(ra);"
+"    await cfgRefresh();"
+"    await refreshAll();"
+"  }catch(e){"
+"    cfgSetMsg('Apply error: '+e);"
+"  }"
+"}"
+
+"async function cfgSave(){"
+"  let r=await post('/api/cfg/save','');"
+"  cfgSetMsg(r);"
+"}"
+
+"async function cfgLoad(){"
+"  let r=await post('/api/cfg/load','');"
+"  cfgSetMsg(r);"
+"  await cfgRefresh();"
+"  await refreshAll();"
+"}"
+
+"async function cfgErase(){"
+"  if(!confirm('Wirklich Factory Reset? NVS wird gelöscht und der ESP startet neu.')) return;"
+"  try{"
+"    let r = await post('/api/cfg/erase','');"
+"    cfgSetMsg(r + ' - Gerät startet neu...');"
+"  }catch(e){"
+"    cfgSetMsg('Factory reset error: ' + e);"
+"  }"
+"}"
+
+"async function cfgDefaults(){"
+"  let r=await post('/api/cfg/defaults','');"
+"  cfgSetMsg(r);"
+"  await cfgRefresh();"
+"  await refreshAll();"
+"}"
+
+"async function doReset(){"
+"  if(!confirm('ESP wirklich neu starten?')) return;"
+"  try{"
+"    let r = await post('/api/reset','');"
+"    cfgSetMsg(r + ' - Gerät startet neu...');"
+"  }catch(e){"
+"    cfgSetMsg('Reset error: ' + e);"
+"  }"
+"}"
+
+"async function refreshAll(){"
+"  document.getElementById('err').textContent='';"
+"  try{"
+"    let j=JSON.parse(await (await fetch('/api/status')).text());"
+"    document.getElementById('st').textContent='call='+j.call+' • mode='+j.node_mode_str+' • wifi='+j.wifi+' • relay='+j.relay+' • crypto='+j.crypto_enable+' • batt='+j.batt;"
+"    document.getElementById('targetinfo').textContent=(j.board||'?') + ' / ' + (j.chip||'?');"
+"    document.getElementById('nm').textContent=j.node_mode_str;"
+"    document.getElementById('cst').textContent=(j.crypto_enable==1)?'ON':'OFF';"
+"    document.getElementById('cst').className=(j.crypto_enable==1)?'ok':'err';"
+"    document.getElementById('secstats').textContent=j.secstats;"
+"    document.getElementById('counters').textContent=j.counters;"
+
+"    let lj=JSON.parse(await (await fetch('/api/lastrx')).text());"
+"    let age=lj.age_ms;"
+"    if(age<0){"
+"      document.getElementById('lastrx').innerHTML='<span class=muted>No RX yet</span>';"
+"      setAmp('#bbb','NO RX','—');"
+"    }else{"
+"      document.getElementById('lastrx').innerHTML='<b>from</b> <code>'+esc(lj.from)+'</code><br><b>text</b> '+esc(lj.text)+'<br><span class=muted>age_ms='+age+'</span>';"
+"      if(age <= 6000) setAmp('#19a34a','OK (fresh)',age+' ms');"
+"      else if(age <= 20000) setAmp('#f59e0b','STALE',age+' ms');"
+"      else setAmp('#dc2626','OLD',age+' ms');"
+"    }"
+
+"    let nj=JSON.parse(await (await fetch('/api/neighbors')).text());"
+"    let nrows=nj.map(x=>[x.call, x.rssi, x.age_ms, x.tx_attempts, x.ack_ok, x.etx_x100]);"
+"    document.getElementById('neigh').innerHTML = nrows.length ? renderTable(['call','rssi','age_ms','tx','ack','etx_x100'], nrows) : '<span class=muted>none</span>';"
+
+"    let rj=JSON.parse(await (await fetch('/api/routes')).text());"
+"    let rrows=rj.map(x=>[x.dst, x.next, x.etx_x100, x.seq, x.age_ms, x.hold_ms]);"
+"    document.getElementById('routes').innerHTML = rrows.length ? renderTable(['dst','next','etx_x100','seq','age_ms','hold_ms'], rrows) : '<span class=muted>none</span>';"
+"  }catch(e){"
+"    document.getElementById('st').textContent='ERROR';"
+"    document.getElementById('err').textContent='Dashboard error: '+e;"
+"    setAmp('#dc2626','UI ERROR','—');"
+"  }"
+"}"
+"cfgRefresh();"
+"refreshAll();"
+"setInterval(refreshAll, 3000);"
 "</script></body></html>";
 
 static esp_err_t index_get(httpd_req_t *req)
@@ -2278,14 +2729,18 @@ static esp_err_t api_status_get(httpd_req_t *req)
         "\"crypto_enable\":%u,"
         "\"node_mode\":%d,"
         "\"node_mode_str\":\"%s\","
+        "\"board\":\"%s\","
+        "\"chip\":\"%s\","
         "\"wifi\":%u,"
         "\"relay\":%u,"
         "\"batt\":\"%s\","
         "\"secstats\":\"",
-        MR_CALLSIGN,
+        g_callsign_rt,
         g_crypto_enable?1:0,
         (int)g_node_mode,
         node_mode_str(g_node_mode),
+        cfg_board_str(),
+        cfg_lora_chip_str(),
         g_wifi_enabled?1:0,
 #if MR_RELAY_ENABLE
         g_relay_on?1:0,
@@ -2530,6 +2985,42 @@ static esp_err_t api_wifi_post(httpd_req_t *req)
     return http_send_text(req, en ? "OK wifi=1" : "OK wifi=0");
 }
 
+static esp_err_t api_relay_post(httpd_req_t *req)
+{
+    char body[64];
+    if(!http_read_body(req, body, sizeof(body))) return http_send_text(req, "ERR body");
+
+    char v[8]={0};
+    if(!form_get(body,"enable",v,sizeof(v))) return http_send_text(req,"ERR missing enable");
+
+    int en = (v[0]=='1');
+
+#if MR_RELAY_ENABLE
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    relay_set(en ? true : false);
+    bool st = g_relay_on;
+    xSemaphoreGive(g_mutex);
+    return http_send_text(req, st ? "OK relay=1" : "OK relay=0");
+#else
+    return http_send_text(req, "ERR relay disabled");
+#endif
+}
+
+static esp_err_t api_relay_toggle_post(httpd_req_t *req)
+{
+    (void)req;
+
+#if MR_RELAY_ENABLE
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    relay_toggle();
+    bool st = g_relay_on;
+    xSemaphoreGive(g_mutex);
+    return http_send_text(req, st ? "OK relay=1" : "OK relay=0");
+#else
+    return http_send_text(req, "ERR relay disabled");
+#endif
+}
+
 // ============================================================================
 // ============================ SENSOR AWAKE ==================================
 // ============================================================================
@@ -2538,48 +3029,78 @@ static void sensor_send_awake(void)
     if(g_node_mode != NODE_SENSOR) return;
 
     // ACKREQ = true -> Relay antwortet sicherer
-    send_data_to(MR_RELAY_CALLSIGN, "SENSOR1:AWAKE", true);
+    send_data_to(g_relay_callsign_rt, "SENSOR1:AWAKE", true);
 }
 // ============================================================================
 // =============================== HTTP start =================================
 // ============================================================================
 static void http_start(void)
 {
-    httpd_config_t cfg=HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size=20000;
-    cfg.max_uri_handlers=24;
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.stack_size = 20000;
+    cfg.max_uri_handlers = 32;
 
-    ESP_ERROR_CHECK(httpd_start(&g_http,&cfg));
+    ESP_ERROR_CHECK(httpd_start(&g_http, &cfg));
 
-    httpd_uri_t u0={.uri="/",.method=HTTP_GET,.handler=index_get};
-    httpd_register_uri_handler(g_http,&u0);
+    httpd_uri_t u0 = { .uri="/",                .method=HTTP_GET,  .handler=index_get };
+    httpd_register_uri_handler(g_http, &u0);
 
-    httpd_uri_t st0={.uri="/api/status",.method=HTTP_GET,.handler=api_status_get};
-    httpd_register_uri_handler(g_http,&st0);
+    httpd_uri_t st0 = { .uri="/api/status",     .method=HTTP_GET,  .handler=api_status_get };
+    httpd_register_uri_handler(g_http, &st0);
 
-    httpd_uri_t lr0={.uri="/api/lastrx",.method=HTTP_GET,.handler=api_lastrx_get};
-    httpd_register_uri_handler(g_http,&lr0);
+    httpd_uri_t lr0 = { .uri="/api/lastrx",     .method=HTTP_GET,  .handler=api_lastrx_get };
+    httpd_register_uri_handler(g_http, &lr0);
 
-    httpd_uri_t n0={.uri="/api/neighbors",.method=HTTP_GET,.handler=api_neighbors_get};
-    httpd_register_uri_handler(g_http,&n0);
+    httpd_uri_t n0 = { .uri="/api/neighbors",   .method=HTTP_GET,  .handler=api_neighbors_get };
+    httpd_register_uri_handler(g_http, &n0);
 
-    httpd_uri_t r0={.uri="/api/routes",.method=HTTP_GET,.handler=api_routes_get};
-    httpd_register_uri_handler(g_http,&r0);
+    httpd_uri_t r0 = { .uri="/api/routes",      .method=HTTP_GET,  .handler=api_routes_get };
+    httpd_register_uri_handler(g_http, &r0);
 
-    httpd_uri_t s0={.uri="/api/send",.method=HTTP_POST,.handler=api_send_post};
-    httpd_register_uri_handler(g_http,&s0);
+    httpd_uri_t s0 = { .uri="/api/send",        .method=HTTP_POST, .handler=api_send_post };
+    httpd_register_uri_handler(g_http, &s0);
 
-    httpd_uri_t cr0={.uri="/api/crypto",.method=HTTP_POST,.handler=api_crypto_post};
-    httpd_register_uri_handler(g_http,&cr0);
+    httpd_uri_t cr0 = { .uri="/api/crypto",     .method=HTTP_POST, .handler=api_crypto_post };
+    httpd_register_uri_handler(g_http, &cr0);
 
-    httpd_uri_t ro0={.uri="/api/role",.method=HTTP_POST,.handler=api_role_post};
-    httpd_register_uri_handler(g_http,&ro0);
+    httpd_uri_t ro0 = { .uri="/api/role",       .method=HTTP_POST, .handler=api_role_post };
+    httpd_register_uri_handler(g_http, &ro0);
 
-    httpd_uri_t w0={.uri="/api/wifi",.method=HTTP_POST,.handler=api_wifi_post};
-    httpd_register_uri_handler(g_http,&w0);
+    httpd_uri_t w0 = { .uri="/api/wifi",        .method=HTTP_POST, .handler=api_wifi_post };
+    httpd_register_uri_handler(g_http, &w0);
 
-    g_http_running=true;
-    ESP_LOGI(TAG,"HTTP server started");
+    httpd_uri_t re0 = { .uri="/api/relay", .method=HTTP_POST, .handler=api_relay_post };
+    httpd_register_uri_handler(g_http, &re0);
+
+    httpd_uri_t rt0 = { .uri="/api/relay/toggle", .method=HTTP_POST, .handler=api_relay_toggle_post };
+    httpd_register_uri_handler(g_http, &rt0);
+
+    httpd_uri_t cg0 = { .uri="/api/cfg",        .method=HTTP_GET,  .handler=api_cfg_get };
+    httpd_register_uri_handler(g_http, &cg0);
+
+    httpd_uri_t cp0 = { .uri="/api/cfg",        .method=HTTP_POST, .handler=api_cfg_post };
+    httpd_register_uri_handler(g_http, &cp0);
+
+    httpd_uri_t cs0 = { .uri="/api/cfg/save",   .method=HTTP_POST, .handler=api_cfg_save_post };
+    httpd_register_uri_handler(g_http, &cs0);
+
+    httpd_uri_t cl0 = { .uri="/api/cfg/load",   .method=HTTP_POST, .handler=api_cfg_load_post };
+    httpd_register_uri_handler(g_http, &cl0);
+
+    httpd_uri_t ca0 = { .uri="/api/cfg/apply",  .method=HTTP_POST, .handler=api_cfg_apply_post };
+    httpd_register_uri_handler(g_http, &ca0);
+
+    httpd_uri_t ce0 = {.uri="/api/cfg/erase", .method=HTTP_POST, .handler=api_cfg_erase_post};
+    httpd_register_uri_handler(g_http, &ce0);
+
+    httpd_uri_t cd0 = { .uri="/api/cfg/defaults", .method=HTTP_POST, .handler=api_cfg_defaults_post };
+    httpd_register_uri_handler(g_http, &cd0);
+
+    httpd_uri_t rs0 = {.uri="/api/reset",        .method=HTTP_POST, .handler=api_reset_post};
+    httpd_register_uri_handler(g_http, &rs0);
+
+    g_http_running = true;
+    ESP_LOGI(TAG, "HTTP server started");
 }
 
 static void http_start_if_needed(void)
@@ -2642,6 +3163,24 @@ static void app_handle_cmd_if_any(const char from7[7], const char *txt)
         return;
     }
 
+    if(strcmp(txt, "CMD:CRYPTO ON")==0 || strcmp(txt, "CRYPTO ON")==0){
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        g_cfg.crypto_enable = true;
+        mr_cfg_apply(&g_cfg);
+        xSemaphoreGive(g_mutex);
+        app_send_reply_to_sender(from7, "CRYPTO: ON");
+        return;
+    }
+
+    if(strcmp(txt, "CMD:CRYPTO OFF")==0 || strcmp(txt, "CRYPTO OFF")==0){
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        g_cfg.crypto_enable = false;
+        mr_cfg_apply(&g_cfg);
+        xSemaphoreGive(g_mutex);
+        app_send_reply_to_sender(from7, "CRYPTO: OFF");
+        return;
+    }
+
 #if MR_RELAY_ENABLE
     if(strcmp(txt, "CMD:RELAY ON")==0){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
@@ -2670,22 +3209,22 @@ static void app_handle_cmd_if_any(const char from7[7], const char *txt)
 #endif
 }
 
-
 // ============================================================================
 // ============================= TX: Beacon/ACK/DATA ==========================
 // ============================================================================
 static void send_beacon(void)
 {
     mr_hdr_v7_t h={0};
+    h.msg_id = mr_next_msg_id();
+    h.seq    = mr_next_seq();
     h.magic[0]='M'; h.magic[1]='R';
     h.version=MR_PROTO_VERSION;
     h.flags=MR_FLAG_BEACON;
     h.ttl=BEACON_TTL;
-    h.msg_id=g_msg_id++;
-    h.seq = g_my_seq++;
-
-    call7_set(h.src, MR_CALLSIGN);
-    call7_set(h.last_hop, MR_CALLSIGN);
+    h.msg_id = mr_next_msg_id();
+    h.seq    = mr_next_seq();
+    call7_set(h.src, g_callsign_rt);
+    call7_set(h.last_hop, g_callsign_rt);
     call7_set(h.final_dst,"*");
     call7_set(h.next_hop,"*");
     h.payload_len=0;
@@ -2710,8 +3249,8 @@ static void send_ack(const mr_hdr_v7_t *rx)
     h.msg_id = rx->msg_id;
     h.seq = g_my_seq; // ack doesn't increment seq here
 
-    call7_set(h.src, MR_CALLSIGN);
-    call7_set(h.last_hop, MR_CALLSIGN);
+    call7_set(h.src, g_callsign_rt);
+    call7_set(h.last_hop, g_callsign_rt);
     memcpy(h.final_dst, rx->last_hop, 7);
     call7_set(h.next_hop, "*");
     h.payload_len=0;
@@ -2730,15 +3269,31 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
     uint8_t buf[sizeof(mr_hdr_v7_t) + MAX_PAYLOAD]={0};
     mr_hdr_v7_t *h=(mr_hdr_v7_t*)buf;
 
+    char dbg_src[8], dbg_dst[8], dbg_last[8], dbg_next[8];
+    call7_to_str(dbg_src, h->src);
+    call7_to_str(dbg_dst, h->final_dst);
+    call7_to_str(dbg_last, h->last_hop);
+    call7_to_str(dbg_next, h->next_hop);
+
+    ESP_LOGW(TAG,
+         "RX FRAME flags=0x%02X src=%s dst=%s last=%s next=%s msg_id=%u seq=%u len=%u",
+         h->flags,
+         dbg_src,
+         dbg_dst,
+         dbg_last,
+         dbg_next,
+         (unsigned)h->msg_id,
+         (unsigned)h->seq,
+         (unsigned)h->payload_len);
+
     h->magic[0]='M'; h->magic[1]='R';
     h->version=MR_PROTO_VERSION;
     h->flags=MR_FLAG_DATA | (ackreq?MR_FLAG_ACKREQ:0);
     h->ttl=DATA_TTL;
-    h->msg_id=g_msg_id++;
-    h->seq=g_my_seq++;
-
-    call7_set(h->src, MR_CALLSIGN);
-    call7_set(h->last_hop, MR_CALLSIGN);
+    h->msg_id = mr_next_msg_id();
+    h->seq    = mr_next_seq();
+    call7_set(h->src, g_callsign_rt);
+    call7_set(h->last_hop, g_callsign_rt);
 
     char dst7[7]; call7_set(dst7, dst_str);
     memcpy(h->final_dst, dst7, 7);
@@ -2753,42 +3308,83 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
     bool crypto=g_crypto_enable;
     if(crypto){
         h->flags |= MR_FLAG_SEC;
+                
+                 ESP_LOGW(TAG, "TX SEC SET dst=%s flags=0x%02X msg_id=%u seq=%u payload_plain=%u",
+                 dst_str,
+                 h->flags,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq,
+                 (unsigned)n);
+
         h->payload_len = (uint8_t)(n + SEC_TAG_LEN);
 
         uint8_t tag[SEC_TAG_LEN]={0};
         if(!sec_encrypt_payload(h, (const uint8_t*)txt, n, pl, tag)){
+            ESP_LOGE(TAG,
+                     "SEC ENCRYPT FAIL dst=%s msg_id=%u seq=%u plain_len=%u key=%02X%02X%02X%02X",
+                     dst_str,
+                     (unsigned)h->msg_id,
+                     (unsigned)h->seq,
+                     (unsigned)n,
+                     g_net_key[0], g_net_key[1], g_net_key[2], g_net_key[3]);
             c_drop_data++;
             return;
         }
         memcpy(pl + n, tag, SEC_TAG_LEN);
+                ESP_LOGW(TAG,
+                 "SEC ENCRYPT OK dst=%s msg_id=%u seq=%u tag=%02X%02X%02X%02X",
+                 dst_str,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq,
+                 tag[0], tag[1], tag[2], tag[3]);
     }else{
         h->payload_len=(uint8_t)n;
         memcpy(pl, txt, n);
+                ESP_LOGW(TAG, "TX PLAIN dst=%s flags=0x%02X msg_id=%u seq=%u payload_plain=%u",
+                 dst_str,
+                 h->flags,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq,
+                 (unsigned)n);
     }
 
     uint16_t frame_len = (uint16_t)(sizeof(mr_hdr_v7_t) + h->payload_len);
 
-    if(bucket_take(&b_data)){
+        if(bucket_take(&b_data)){
         c_tx_data++;
 
-    if (ackreq) {
-        xSemaphoreTake(g_mutex, portMAX_DELAY);
-        pending_add_locked(h->msg_id, h->final_dst, (const uint8_t*)buf, frame_len);
-        neighbor_tx_attempt_locked(h->final_dst);
-        xSemaphoreGive(g_mutex);
-    }
+        ESP_LOGW(TAG,
+                 "TX AIR dst=%s flags=0x%02X msg_id=%u seq=%u frame_len=%u",
+                 dst_str,
+                 h->flags,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq,
+                 (unsigned)frame_len);
 
-    lora_send_frame(buf, frame_len);
+        if (ackreq) {
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            pending_add_locked(h->msg_id, h->final_dst, (const uint8_t*)buf, frame_len);
+            neighbor_tx_attempt_locked(h->final_dst);
+            xSemaphoreGive(g_mutex);
+        }
+
+        lora_send_frame(buf, frame_len);
+
+        ESP_LOGW(TAG,
+                 "TX AIR DONE dst=%s msg_id=%u seq=%u",
+                 dst_str,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq);
+
     }else{
         c_defer_data++;
+        ESP_LOGE(TAG,
+                 "TX DEFER bucket empty dst=%s flags=0x%02X msg_id=%u seq=%u",
+                 dst_str,
+                 h->flags,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq);
     }
-
-    /*if(bucket_take(&b_data)){
-        c_tx_data++;
-        lora_send_frame(buf, sizeof(mr_hdr_v7_t)+h->payload_len);
-    }else{
-        c_defer_data++;
-    }*/
 }
 
 
@@ -2807,7 +3403,23 @@ static void handle_rx(void)
     mr_hdr_v7_t *h=(mr_hdr_v7_t*)buf;
     if(h->magic[0]!='M'||h->magic[1]!='R') return;
     if(h->version!=MR_PROTO_VERSION) return;
+    char dbg_src[8], dbg_dst[8], dbg_last[8], dbg_next[8];
+    call7_to_str(dbg_src, h->src);
+    call7_to_str(dbg_dst, h->final_dst);
+    call7_to_str(dbg_last, h->last_hop);
+    call7_to_str(dbg_next, h->next_hop);
 
+    ESP_LOGW(TAG,
+             "RX FRAME flags=0x%02X src=%s dst=%s last=%s next=%s msg_id=%u seq=%u len=%u rssi=%d",
+             h->flags,
+             dbg_src,
+             dbg_dst,
+             dbg_last,
+             dbg_next,
+             (unsigned)h->msg_id,
+             (unsigned)h->seq,
+             (unsigned)h->payload_len,
+             rssi);
     // ACK: not duplicate filtered
     if(h->flags & MR_FLAG_ACK){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
@@ -2818,7 +3430,11 @@ static void handle_rx(void)
         return;
     }
 
-    if(seen_before(h->src, h->msg_id)) return;
+    if(seen_before(h->src, h->msg_id)){
+        ESP_LOGE(TAG, "RX DROP seen_before src=%.7s msg_id=%u",
+                 h->src, (unsigned)h->msg_id);
+        return;
+    }
     remember_msg(h->src, h->msg_id);
 
     xSemaphoreTake(g_mutex, portMAX_DELAY);
@@ -2838,12 +3454,29 @@ static void handle_rx(void)
         return;
     }
 
-    if(h->flags & MR_FLAG_DATA){
-        char my7[7]; call7_set(my7, MR_CALLSIGN);
-        if(call7_eq(h->final_dst, my7)){
-            char txt[MAX_PAYLOAD+1]={0};
+        if(h->flags & MR_FLAG_DATA){
+        char my7[7];
+        char my_str[8];
+        call7_set(my7, g_callsign_rt);
+        call7_to_str(my_str, my7);
+
+        ESP_LOGW(TAG, "RX DATA check: dst=%.7s my=%s sec=%u",
+                 h->final_dst,
+                 my_str,
+                 ((h->flags & MR_FLAG_SEC) ? 1 : 0));
+
+        if(call7_eq(h->final_dst, my7)){        char txt[MAX_PAYLOAD+1]={0};
 
             if((h->flags & MR_FLAG_SEC) != 0){
+                char dbg_from[8];
+call7_to_str(dbg_from, h->src);
+
+ESP_LOGW(TAG,
+         "SEC RX detected from=%s msg_id=%u seq=%u payload_len=%u",
+         dbg_from,
+         (unsigned)h->msg_id,
+         (unsigned)h->seq,
+         (unsigned)h->payload_len);
                 if(h->payload_len < SEC_TAG_LEN){
                     xSemaphoreTake(g_mutex, portMAX_DELAY);
                     sec_decrypt_fail++;
@@ -2855,6 +3488,9 @@ static void handle_rx(void)
                 bool fresh = replay_check_locked(h->src, h->seq);
                 xSemaphoreGive(g_mutex);
                 if(!fresh){
+                     ESP_LOGE(TAG,"SEC FAIL replay src=%.7s seq=%u",
+                        h->src,(unsigned)h->seq);
+
                     xSemaphoreTake(g_mutex, portMAX_DELAY);
                     sec_replay_drop++;
                     xSemaphoreGive(g_mutex);
@@ -2869,15 +3505,34 @@ static void handle_rx(void)
                 memset(plain,0,sizeof(plain));
 
                 if(!sec_decrypt_payload(h, pl, ciph_len, tag, plain)){
+
+                ESP_LOGE(TAG,
+                    "SEC FAIL decrypt msg_id=%u seq=%u ciph_len=%u",
+                    (unsigned)h->msg_id,
+                    (unsigned)h->seq,
+                    (unsigned)ciph_len);
+
                     xSemaphoreTake(g_mutex, portMAX_DELAY);
-                    sec_mac_fail++; sec_decrypt_fail++;
+                    sec_mac_fail++; 
+                    sec_decrypt_fail++;
                     xSemaphoreGive(g_mutex);
-                    return;
+                return;
                 }
+
+                 ESP_LOGW(TAG,
+                 "SEC RX decrypt OK from=%s msg_id=%u seq=%u plain_len=%u",
+                 dbg_from,
+                 (unsigned)h->msg_id,
+                 (unsigned)h->seq,
+                 (unsigned)ciph_len);
 
                 xSemaphoreTake(g_mutex, portMAX_DELAY);
                 replay_update_locked(h->src, h->seq);
                 sec_decrypt_ok++;
+                ESP_LOGI(TAG,
+                "SEC OK msg_id=%u seq=%u",
+                (unsigned)h->msg_id,
+                (unsigned)h->seq);
                 xSemaphoreGive(g_mutex);
 
                 size_t copy = (ciph_len < MAX_PAYLOAD) ? ciph_len : MAX_PAYLOAD;
@@ -3027,11 +3682,17 @@ static void cli_print_help(void)
     printf("wifi on|off\n");
     printf("role 0|1|2       (0=RELAY 1=EDGE 2=SENSOR)\n");
     printf("crypto on|off\n");
+    printf("cfg get\n");
+    printf("cfg set <key> <val>\n");
+    printf("cfg save\n");
+    printf("cfg load\n");
+    printf("cfg defaults\n");
+    printf("cfg apply\n");
 #if MR_RELAY_ENABLE
     printf("relay on|off|toggle\n");
 #endif
     printf("send <DST> <ACK 0|1> <TEXT...>\n");
-    printf("cmd  <DST> <ACK 0|1> STATUS|RELAYON|RELAYOFF|RELAYTOG\n");
+    printf("cmd  <DST> <ACK 0|1> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF\n");
     printf("---------------------\n\n");
 }
 
@@ -3163,35 +3824,49 @@ static void cli_handle_line(char *line)
     }
 
     if(streq_ci(cmd,"crypto")){
-        char *arg=strtok_r(NULL, " \t", &save);
-        if(!arg){ printf("ERR crypto on|off\n"); return; }
-        xSemaphoreTake(g_mutex, portMAX_DELAY);
-        if(streq_ci(arg,"on")) g_crypto_enable=true;
-        else if(streq_ci(arg,"off")) g_crypto_enable=false;
-        else { xSemaphoreGive(g_mutex); printf("ERR crypto on|off\n"); return; }
-        bool st=g_crypto_enable;
+    char *arg=strtok_r(NULL, " \t", &save);
+    if(!arg){ printf("ERR crypto on|off\n"); return; }
+
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+
+    if(streq_ci(arg,"on")){
+        g_cfg.crypto_enable = true;
+        mr_cfg_apply(&g_cfg);
+    }
+    else if(streq_ci(arg,"off")){
+        g_cfg.crypto_enable = false;
+        mr_cfg_apply(&g_cfg);
+    }
+    else{
         xSemaphoreGive(g_mutex);
-        printf("OK crypto=%s\n", st?"ON":"OFF");
+        printf("ERR crypto on|off\n");
         return;
     }
+
+    bool st = g_crypto_enable;
+    xSemaphoreGive(g_mutex);
+
+    printf("OK crypto=%s\n", st?"ON":"OFF");
+    return;
+}
+
 
 #if MR_RELAY_ENABLE
     if(streq_ci(cmd,"relay")){
-        if(g_node_mode != NODE_RELAY){ printf("ERR relay only valid in RELAY role\n"); return; }
-        char *arg=strtok_r(NULL, " \t", &save);
-        if(!arg){ printf("ERR relay on|off|toggle\n"); return; }
+    char *arg=strtok_r(NULL, " \t", &save);
+    if(!arg){ printf("ERR relay on|off|toggle\n"); return; }
 
-        xSemaphoreTake(g_mutex, portMAX_DELAY);
-        if(streq_ci(arg,"on")) relay_set(true);
-        else if(streq_ci(arg,"off")) relay_set(false);
-        else if(streq_ci(arg,"toggle")) relay_toggle();
-        else { xSemaphoreGive(g_mutex); printf("ERR relay on|off|toggle\n"); return; }
-        bool st=g_relay_on;
-        xSemaphoreGive(g_mutex);
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if(streq_ci(arg,"on")) relay_set(true);
+    else if(streq_ci(arg,"off")) relay_set(false);
+    else if(streq_ci(arg,"toggle")) relay_toggle();
+    else { xSemaphoreGive(g_mutex); printf("ERR relay on|off|toggle\n"); return; }
+    bool st=g_relay_on;
+    xSemaphoreGive(g_mutex);
 
-        printf("OK relay=%s\n", st?"ON":"OFF");
-        return;
-    }
+    printf("OK relay=%s\n", st?"ON":"OFF");
+    return;
+}
 #endif
 
     if(streq_ci(cmd,"send")){
@@ -3211,16 +3886,102 @@ static void cli_handle_line(char *line)
         char *dst=strtok_r(NULL, " \t", &save);
         char *ack=strtok_r(NULL, " \t", &save);
         char *what=strtok_r(NULL, " \t", &save);
-        if(!dst || !ack || !what){ printf("ERR cmd <DST> <ACK> STATUS|RELAYON|RELAYOFF|RELAYTOG\n"); return; }
+        if(!dst || !ack || !what){
+            printf("ERR cmd <DST> <ACK> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF\n");
+            return;
+        }
         int a=atoi(ack);
 
-        if(streq_ci(what,"STATUS")) send_data_to(dst, "CMD:STATUS?", (a!=0));
-        else if(streq_ci(what,"RELAYON")) send_data_to(dst, "CMD:RELAY ON", (a!=0));
-        else if(streq_ci(what,"RELAYOFF")) send_data_to(dst, "CMD:RELAY OFF", (a!=0));
-        else if(streq_ci(what,"RELAYTOG")) send_data_to(dst, "CMD:RELAY TOGGLE", (a!=0));
-        else { printf("ERR unknown cmd\n"); return; }
+        if(streq_ci(what,"STATUS")){
+            send_data_to(dst, "CMD:STATUS?", (a!=0));
+        }
+        else if(streq_ci(what,"RELAY")){
+            char *arg=strtok_r(NULL, " \t", &save);
+            if(!arg){ printf("ERR cmd <DST> <ACK> RELAY ON|OFF|TOGGLE\n"); return; }
+
+            if(streq_ci(arg,"ON")) send_data_to(dst, "CMD:RELAY ON", (a!=0));
+            else if(streq_ci(arg,"OFF")) send_data_to(dst, "CMD:RELAY OFF", (a!=0));
+            else if(streq_ci(arg,"TOGGLE")) send_data_to(dst, "CMD:RELAY TOGGLE", (a!=0));
+            else { printf("ERR cmd <DST> <ACK> RELAY ON|OFF|TOGGLE\n"); return; }
+        }
+        else if(streq_ci(what,"CRYPTO")){
+            char *arg=strtok_r(NULL, " \t", &save);
+            if(!arg){ printf("ERR cmd <DST> <ACK> CRYPTO ON|OFF\n"); return; }
+
+            if(streq_ci(arg,"ON")) send_data_to(dst, "CMD:CRYPTO ON", (a!=0));
+            else if(streq_ci(arg,"OFF")) send_data_to(dst, "CMD:CRYPTO OFF", (a!=0));
+            else { printf("ERR cmd <DST> <ACK> CRYPTO ON|OFF\n"); return; }
+        }
+        else{
+            printf("ERR unknown cmd\n");
+            return;
+        }
 
         printf("OK cmd sent\n");
+        return;
+    }
+
+        if(streq_ci(cmd,"cfg")){
+        char *sub=strtok_r(NULL," \t",&save);
+        if(!sub){ printf("ERR cfg get|set|save|load|defaults|apply\n"); return; }
+
+        if(streq_ci(sub,"get")){
+            char j[768];
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            mr_cfg_to_json(&g_cfg, j, sizeof(j));
+            xSemaphoreGive(g_mutex);
+            printf("%s\n", j);
+            return;
+        }
+        if(streq_ci(sub,"set")){
+            char *k=strtok_r(NULL," \t",&save);
+            char *v=strtok_r(NULL,"",&save); // rest of line
+            if(!k || !v){ printf("ERR cfg set <key> <val>\n"); return; }
+            while(*v==' '||*v=='\t') v++;
+            bool ok=false;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            ok = mr_cfg_set_kv(&g_cfg, k, v);
+            if(ok) mr_cfg_apply(&g_cfg);
+            xSemaphoreGive(g_mutex);
+            printf(ok ? "OK\n" : "ERR invalid\n");
+            return;
+        }
+        if(streq_ci(sub,"save")){
+            bool ok=false;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            ok = mr_cfg_save_nvs(&g_cfg);
+            xSemaphoreGive(g_mutex);
+            printf(ok ? "OK saved\n" : "ERR save\n");
+            return;
+        }
+        if(streq_ci(sub,"load")){
+            bool ok=false;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            ok = mr_cfg_load_nvs(&g_cfg);
+            if(ok) mr_cfg_apply(&g_cfg);
+            xSemaphoreGive(g_mutex);
+            printf(ok ? "OK loaded\n" : "ERR load\n");
+            return;
+        }
+        if(streq_ci(sub,"defaults")){
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            mr_cfg_defaults(&g_cfg);
+            // keep key from compile-time if you want:
+            (void)parse_key_hex16(MR_NET_KEY_HEX, g_cfg.net_key);
+            mr_cfg_apply(&g_cfg);
+            xSemaphoreGive(g_mutex);
+            printf("OK defaults applied\n");
+            return;
+        }
+        if(streq_ci(sub,"apply")){
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            mr_cfg_apply(&g_cfg);
+            xSemaphoreGive(g_mutex);
+            printf("OK applied\n");
+            return;
+        }
+
+        printf("ERR cfg get|set|save|load|defaults|apply\n");
         return;
     }
 
@@ -3412,10 +4173,6 @@ static void mr_enter_deep_sleep(uint32_t sleep_ms)
 // - RELAY/EDGE: keine Sleep-Logik, laufen normal weiter
 // ============================================================================
 
-// Optional: Ziel-Callsign für den "AWAKE"-Ping des Sensors
-#ifndef MR_RELAY_CALLSIGN
-#define MR_RELAY_CALLSIGN "DJ1ABCF"   // <-- hier dein RELAY Callsign eintragen
-#endif
 
 
 // Forward Decl (falls du es schon woanders hast: ok, sonst hier belassen)
@@ -3459,7 +4216,6 @@ void app_main(void)
     // 1) Board Power / VEXT / Battery Divider init (Heltec)
     // ------------------------------------------------------------------------
 #if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
-    // Heltec: VEXT an + Battery-Enable Pin init
     board_power_boot_init();
 #endif
 
@@ -3474,7 +4230,6 @@ void app_main(void)
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    // Wichtig: msg_id/seq stabil über DeepSleep (sonst Dupe-Filter killt "AWAKE")
     mr_init_msg_seq_from_rtc();
 
     bucket_init(&b_beacon,   RL_BEACON_TPS,   RL_BEACON_BURST);
@@ -3488,30 +4243,65 @@ void app_main(void)
     }
 
     // ------------------------------------------------------------------------
+    // 2b) Config init + NVS load
+    // ------------------------------------------------------------------------
+    mr_cfg_defaults(&g_cfg);
+
+    if(!parse_key_hex16(MR_NET_KEY_HEX, g_cfg.net_key)){
+        ESP_LOGE(TAG,"Invalid MR_NET_KEY_HEX – need 32 hex chars");
+        abort();
+    }
+
+    if(mr_cfg_load_nvs(&g_cfg)){
+        ESP_LOGI(TAG,"Config loaded from NVS");
+    }else{
+        ESP_LOGI(TAG,"No NVS config, using defaults");
+    }
+
+    // ------------------------------------------------------------------------
     // 3) Station Addons (Relay GPIO, Battery ADC)
     // ------------------------------------------------------------------------
 #if MR_RELAY_ENABLE
     relay_init();
-    // HOLD nach Wake wieder freigeben
-    gpio_deep_sleep_hold_dis();     // global deep-sleep hold aus
-    gpio_hold_dis((gpio_num_t)RELAY_GPIO);  // falls der Pin gelatcht war, freigeben
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)g_relay_gpio_runtime);
 #endif
 
 #if MR_BATT_ENABLE
     batt_init();
 #endif
 
-#if MR_BME280_ENABLE
-    (void)bme280_init();
-#endif
+// ------------------------------------------------------------------------
+// Runtime-Config zuerst anwenden
+// ------------------------------------------------------------------------
 
-    // ------------------------------------------------------------------------
-    // 4) LoRa init (SPI + Chip)
-    // ------------------------------------------------------------------------
+    g_rf_freq_hz_runtime   = g_cfg.rf_freq_hz;
+    g_tx_power_dbm_runtime = g_cfg.tx_power_dbm;
+    g_relay_gpio_runtime   = g_cfg.relay_gpio;
+
+    mr_cfg_apply(&g_cfg);
+
+    #if MR_BME280_ENABLE
+        if(g_bme280_enable){
+            (void)bme280_init();
+        }
+    #endif
+
+config_print();
+
+// ------------------------------------------------------------------------
+// 4) LoRa init (SPI + Chip)
+// ------------------------------------------------------------------------
+
     init_spi();
     lora_hw_reset();
     lora_log_chip_info();
     lora_init_radio();
+
+#if MR_RELAY_ENABLE
+    // falls relay_gpio aus NVS geladen wurde und sich geändert hat:
+    gpio_hold_dis((gpio_num_t)g_relay_gpio_runtime);
+#endif
 
     // IRQ line -> dio_task() -> handle_rx()
     init_dio_irq();
@@ -3542,106 +4332,107 @@ void app_main(void)
 
     ESP_LOGI(TAG,
              "CALL=%s  mode=%s  crypto=%u  net_id=0x%02X  wifi=%u",
-             MR_CALLSIGN, node_mode_str(g_node_mode),
+             g_callsign_rt, node_mode_str(g_node_mode),
              g_crypto_enable?1:0,
              (unsigned)MR_NET_ID,
              g_wifi_enabled?1:0);
 
     // ------------------------------------------------------------------------
-    // 7) SENSOR: Boot-Aktion (AWAKE + RX-Fenster + optional Sleep)
+    // 7) SENSOR: Boot-Aktion
     // ------------------------------------------------------------------------
-        if(g_node_mode == NODE_SENSOR){
+    if(g_node_mode == NODE_SENSOR){
 
-        // Sicherstellen, dass wir RX sind (Radio ist zwar schon im RX cont, aber schadet nicht)
         lora_set_rx_continuous();
-
-        // Kleines Stabilitäts-Delay nach Radio-Init (hilft oft bei Heltec/SX1262)
         vTaskDelay(pdMS_TO_TICKS(150));
 
-        // "Ich bin wach" – mit ACKREQ, damit du es als zuverlässig werten kannst.
-        // Voraussetzung: send_data_to() muss pending_add + retry wirklich aktiv haben (Patch).
-        #if MR_BME280_ENABLE
-        int32_t t_x100=0; uint32_t p_pa=0; uint32_t rh_x1000=0;
         char wx[160];
-        (void)bme_write(BME280_REG_CTRL_HUM, 0x01);
-        (void)bme_write(BME280_REG_CTRL_MEAS, (0x01<<5) | (0x01<<2) | 0x03);
-        vTaskDelay(pdMS_TO_TICKS(120));   // BME stabilisiert Feuchte nach Start
-        if(bme280_read_weather(&t_x100, &p_pa, &rh_x1000)){
-            vTaskDelay(pdMS_TO_TICKS(120));   // BME stabilisiert Feuchte nach Start
-            int32_t t_int  = t_x100 / 100;
-            int32_t t_frac = llabs(t_x100 % 100);
-            
-            int32_t p_hpa = (int32_t)(p_pa / 100U) + (int32_t)BME_PRESS_OFFSET_HPA;
-            if(p_hpa < 300) p_hpa = 300;
-            if(p_hpa > 1100) p_hpa = 1100;
+        strcpy(wx, "SENSOR:AWAKE");
 
-            uint32_t rh_int  = rh_x1000 / 1000U;
-            uint32_t rh_frac = (rh_x1000 % 1000U) / 10U; // 2 Nachkommastellen
+#if MR_BME280_ENABLE
+        if(g_bme280_enable){
+            int32_t t_x100 = 0;
+            uint32_t p_pa = 0;
+            uint32_t rh_x1000 = 0;
 
-            // snprintf(wx, sizeof(wx),
-            //         "SENSOR:AWAKE WX t=%" PRId32 ".%02" PRId32 "C p=%" PRIu32 "hPa rh=%" PRIu32 ".%02" PRIu32 "%%",
-            //         t_int, t_frac, p_hpa, rh_int, rh_frac);
+            if(bme280_read_weather(&t_x100, &p_pa, &rh_x1000)){
+                int32_t t_int  = t_x100 / 100;
+                int32_t t_frac = llabs(t_x100 % 100);
 
-            #if MR_BATT_ENABLE
+                int32_t p_hpa = (int32_t)(p_pa / 100U) + (int32_t)BME_PRESS_OFFSET_HPA;
+                if(p_hpa < 300) p_hpa = 300;
+                if(p_hpa > 1100) p_hpa = 1100;
+
+                uint32_t rh_int  = rh_x1000 / 1000U;
+                uint32_t rh_frac = (rh_x1000 % 1000U) / 10U;
+
+#if MR_BATT_ENABLE
                 batt_force_read_once();
-            #endif
-            
-            snprintf(wx, sizeof(wx),
-                "SENSOR:AWAKE WX t=%" PRId32 ".%02" PRId32 "C "
-                "p=%" PRIu32 "hPa "
-                "rh=%" PRIu32 ".%02" PRIu32 "%% "
-                "bat=%" PRIu32 "mV "
-                "bat=%" PRIu32 "%%",
-                t_int, t_frac,
-                p_hpa,
-                rh_int, rh_frac,
-                g_batt_mv,
-                g_batt_pct);
-        }else{
-            snprintf(wx, sizeof(wx), "SENSOR:AWAKE WX ERR");
+                batt_poll();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                batt_poll();
+#endif
+
+                snprintf(wx, sizeof(wx),
+                    "SENSOR:AWAKE WX t=%" PRId32 ".%02" PRId32 "C "
+                    "p=%" PRIu32 "hPa "
+                    "rh=%" PRIu32 ".%02" PRIu32 "%% "
+                    "bat=%" PRIu32 "mV "
+                    "bat=%" PRIu32 "%%",
+                    t_int, t_frac,
+                    p_hpa,
+                    rh_int, rh_frac,
+                    g_batt_mv,
+                    g_batt_pct);
+            }else{
+                snprintf(wx, sizeof(wx), "SENSOR:AWAKE WX ERR");
+            }
         }
+#endif
 
-        send_data_to(MR_RELAY_CALLSIGN, wx, true);
-        #else
-        send_data_to(MR_RELAY_CALLSIGN, "SENSOR:AWAKE", true);
-        #endif
-
-        // Downlink-Fenster: RELAY kann in dieser Zeit CMDs schicken (z.B. "CMD:RELAY ON")
-        sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
+send_data_to(g_relay_callsign_rt, wx, false);
+sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
 
 #if MR_POWERSAVE_ENABLE
+        if(g_powersave_enable){
     #if MR_RELAY_ENABLE
-        // Pin ist bereits als Output gesetzt (durch relay_init/relay_set)
-        gpio_hold_en((gpio_num_t)RELAY_GPIO);
-        gpio_deep_sleep_hold_en();   // hält digitale GPIOs im Deep-Sleep
+            gpio_hold_en((gpio_num_t)g_relay_gpio_runtime);
+            gpio_deep_sleep_hold_en();
     #endif
 
-        
-        // Danach schlafen (periodischer Wakeup)
-        mr_enter_deep_sleep(SENSOR_WAKE_PERIOD_MS);
+            // ---- Pending Retry Queue löschen ----
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            pending_clear_all_locked();
+            xSemaphoreGive(g_mutex);
+
+            ESP_LOGI(TAG, "SENSOR: powersave runtime=ON -> deep sleep");
+            mr_enter_deep_sleep(g_cfg.sensor_wake_period_ms);
+        }else{
+            ESP_LOGI(TAG, "SENSOR: powersave runtime=OFF -> staying awake");
+        }
 #else
-        // Ohne PowerSave bleibt SENSOR dauerhaft im Loop (wie ein normaler Node),
-        // aber sendet eben keine Beacons (siehe Loop unten).
-        ESP_LOGI(TAG, "SENSOR: powersave disabled -> staying awake");
+        ESP_LOGI(TAG, "SENSOR: powersave compile-time disabled -> staying awake");
 #endif
     }
 
+    config_print();
+
+
     // ------------------------------------------------------------------------
-    // 8) Main Loop (RELAY/EDGE normal; SENSOR nur wenn MR_POWERSAVE_ENABLE=0)
+    // 8) Main Loop
     // ------------------------------------------------------------------------
     while(1){
         vTaskDelay(pdMS_TO_TICKS(50));
 
 #if MR_BATT_ENABLE
         batt_poll();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        batt_poll();
 #endif
 
-        // Beacons NICHT im SENSOR-Mode (so wie du es schon hattest)
         if(g_beacon_enabled && g_node_mode != NODE_SENSOR && now_ms() > g_next_beacon_ms){
             send_beacon();
         }
 
-        // Housekeeping
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         neighbor_cleanup_locked();
         route_cleanup_locked();

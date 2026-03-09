@@ -1,10 +1,71 @@
-/* ============================================================================
- * FILE: radio_config.h
- * ============================================================================
- * Radio helpers 
- * Include AFTER config_meshradio.h
- * ============================================================================
- */
+/******************************************************************************
+ *  MeshRadio Project
+ *
+ *  FILE: radio_config.h
+ *
+ *  DESCRIPTION
+ *  ---------------------------------------------------------------------------
+ *  Radio configuration helper functions for the MeshRadio firmware.
+ *
+ *  This header provides small utility functions used for configuring LoRa
+ *  radio chips supported by the MeshRadio project. It converts human-readable
+ *  frequency values (Hz) into the register formats required by the hardware.
+ *
+ *  Supported radio chips:
+ *
+ *      • SX1276 / SX1278
+ *        Register-based LoRa transceivers commonly used in ESP32 boards
+ *        such as LILYGO / TTGO devices.
+ *
+ *      • SX1262
+ *        Command-based LoRa transceiver used in newer ESP32-S3 boards
+ *        such as the Heltec LoRa 32 V3.x series.
+ *
+ *  The helper functions convert frequency values into:
+ *
+ *      - SX127x FRF register format
+ *      - SX126x RF frequency step format
+ *
+ *  These conversions are required because both radio families internally use
+ *  fixed-point frequency representations derived from the 32 MHz crystal
+ *  reference clock.
+ *
+ *  This file must be included AFTER "config_meshradio.h".
+ *
+ *
+ *  AUTHOR
+ *  ---------------------------------------------------------------------------
+ *  Friedrich Riedhammer (Fritz)
+ *  NerdVerlag
+ *  https://nerdverlag.com
+ *  fritz@nerdverlag.com
+ *
+ *
+ *  COPYRIGHT
+ *  ---------------------------------------------------------------------------
+ *  (c) 2026 Friedrich Riedhammer / NerdVerlag
+ *
+ *  This software is provided "as is", without any express or implied warranty.
+ *  In no event will the author be held liable for any damages arising from
+ *  the use of this software.
+ *
+ *  Permission is granted to use, modify, and distribute this software for
+ *  educational, experimental, and amateur radio purposes, provided that this
+ *  copyright notice and this disclaimer remain intact in all copies.
+ *
+ *  Commercial use or redistribution requires permission from the author.
+ *
+ *  This software is intended for experimentation and research in wireless
+ *  mesh networking using LoRa technology. The author does not guarantee
+ *  correctness, regulatory compliance, or suitability for any specific
+ *  purpose.
+ *
+ *  Users are responsible for complying with local radio regulations.
+ *
+ *  Use at your own risk.
+ *
+ ******************************************************************************/
+
 #pragma once
 
 #include <stdint.h>

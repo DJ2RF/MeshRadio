@@ -68,6 +68,14 @@ Workflow:
 
 Der Command wird **nur einmal** ausgeführt.
 
+Die Commands sind:
+
+CMD:RELAY ON
+
+CMD:RELAY OFF
+
+CMD:RELAY TOGGLE
+
 Statusanzeige:
 
 
@@ -246,6 +254,11 @@ Beispiel:
 
 
 CMD:RELAY ON
+
+CMD:RELAY OFF
+
+CMD:RELAY TOGGLE
+
 
 
 Dann:

@@ -1,11 +1,68 @@
-/* ============================================================================
- * FILE: board_pins.h
- * ============================================================================
- * Board-dependent pin mapping (aktuelle Werte aus deinem Code).
- * Include AFTER config_meshradio.h
- * ============================================================================
- */
-#pragma once
+/******************************************************************************
+ *  MeshRadio Project
+ *
+ *  FILE: board_pins.h
+ *
+ *  DESCRIPTION
+ *  ---------------------------------------------------------------------------
+ *  Board-specific hardware configuration for the MeshRadio firmware.
+ *
+ *  This header defines all GPIO assignments required for the radio, SPI bus,
+ *  battery measurement, I²C interface, and optional peripherals depending on
+ *  the selected board preset.
+ *
+ *  Supported boards currently include:
+ *
+ *      - Heltec LoRa 32 V3.x (SX1262)
+ *      - LILYGO / TTGO SX1276 based boards
+ *
+ *  The file provides a unified abstraction layer for different hardware
+ *  layouts so that the main firmware can operate independently of the
+ *  physical board wiring.
+ *
+ *  Each board preset defines:
+ *
+ *      - LoRa SPI interface pins (SCK, MOSI, MISO, NSS)
+ *      - LoRa control lines (RESET, IRQ, BUSY)
+ *      - battery measurement pins and divider ratios
+ *      - I²C bus pins for sensors or displays
+ *      - optional relay or control GPIOs
+ *
+ *  Additional compile-time guards are implemented to prevent hardware pin
+ *  conflicts (for example between LoRa IRQ lines and relay outputs).
+ *
+ *  This file must be included AFTER "config_meshradio.h" so that the selected
+ *  board preset (MR_BOARD_PRESET) is already defined.
+ *
+ *
+ *  AUTHOR
+ *  ---------------------------------------------------------------------------
+ *  Friedrich Riedhammer (Fritz)
+ *  https://nerdverlag.com
+ *  fritz@nerdverlag.com
+ *
+ *
+ *  COPYRIGHT
+ *  ---------------------------------------------------------------------------
+ *  (c) 2026 Friedrich Riedhammer / NerdVerlag
+ *
+ *  This software is provided "as is", without any express or implied warranty.
+ *  In no event will the author be held liable for any damages arising from
+ *  the use of this software.
+ *
+ *  Permission is granted to use, modify, and distribute this software for
+ *  educational, experimental, and amateur radio purposes, provided that this
+ *  copyright notice and this disclaimer remain intact in all copies.
+ *
+ *  This software is intended for experimentation and research in wireless
+ *  mesh networking. The author does not guarantee correctness, reliability,
+ *  or suitability for any specific purpose.
+ *
+ *  Use at your own risk.
+ *
+ ******************************************************************************/
+
+ #pragma once
 
 #include "config_meshradio.h"
 
