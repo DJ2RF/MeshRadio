@@ -98,19 +98,32 @@
  *  werden.
  */
 #ifndef MR_BOARD_PRESET
-#define MR_BOARD_PRESET MR_BOARD_HELTEC_V3 // MR_BOARD_HELTEC_V3  // <-- HIER UMSCHALTEN
+#define MR_BOARD_PRESET MR_BOARD_LILYGO_SX1276  // <-- HIER UMSCHALTEN
+#endif
+
+/* -----------------------------------------------------------
+   Board-Name als lesbarer String für Web / OTA / Debug
+   ----------------------------------------------------------- */
+#if MR_BOARD_PRESET == MR_BOARD_LILYGO_SX1276
+#define MR_BOARD_NAME "LILYGO SX1276"
+
+#elif MR_BOARD_PRESET == MR_BOARD_HELTEC_V3
+#define MR_BOARD_NAME "Heltec V3"
+
+#else
+#define MR_BOARD_NAME "Unknown Board"
 #endif
 
 // ---- Callsign / WiFi ----
 /*
  * g_callsign:
- *   - Node-ID/Callsign (max. 7 Zeichen werden im Protokoll genutzt)
+ *   - Node-ID/Callsign (max. 8 Zeichen werden im Protokoll genutzt)
  *   - Wird in Frames als Quelle (src) verwendet und im Web/CLI angezeigt.
  * 
  */
 
-#define MR_CALLSIGN        "DL7ABCF"
-#define MR_RELAY_CALLSIGN  "DJ1ABCF"
+#define MR_CALLSIGN        "DJ2RF-20"
+#define MR_RELAY_CALLSIGN  "DJ2RF-20"
 
 
 /*
@@ -119,8 +132,19 @@
  *   - PASS = ""  -> OPEN (ohne Passwort)
  *   - PASS >= 8  -> WPA2-PSK
  */
-#define MR_WIFI_AP_SSID    "MeshRadio-Setup4"
+#define MR_WIFI_AP_SSID    "MeshRadio-Setup2"
 #define MR_WIFI_AP_PASS    ""          // "" => OPEN; >=8 Zeichen => WPA2-PSK
+
+// =========================== WIFI STA CONFIG ===============================
+
+// Router WLAN (Station Mode)
+#define MR_WIFI_STA_ENABLE   1
+
+#define MR_WIFI_STA_SSID     "farswitch"
+#define MR_WIFI_STA_PASS     "Kl79_?Sa13_04_1961Kl79_?Sa"
+// DHCP Hostname automatisch generieren (MeshRadio-XX)
+#define MR_WIFI_STA_DHCP_HOSTNAME  1
+#define MR_WIFI_STA_RETRY_MAX  2
 
 // ---- RF Frequency (EU 863–870) ----
 /*
@@ -155,9 +179,9 @@
  * ACK_BACKOFF_MS:
  *   - Zufälliger Backoff (0..ACK_BACKOFF_MS) vor einem Retry
  */
-#define ACK_TIMEOUT_MS     1200
+#define ACK_TIMEOUT_MS     2200
 #define ACK_RETRY_MAX      2
-#define ACK_BACKOFF_MS     350
+#define ACK_BACKOFF_MS     500
 
 /*
  * ETX_MAX_X100:
@@ -236,7 +260,7 @@
  * DEFAULT_NODE_MODE:
  *   - 0 = RELAY, 1 = EDGE, 2 = SENSOR
  */
-#define DEFAULT_NODE_MODE  2   // 0=RELAY, 1=EDGE, 2=SENSOR
+#define DEFAULT_NODE_MODE  0   // 0=RELAY, 1=EDGE, 2=SENSOR
 
 // ---- Power save  ----
 /*
@@ -244,7 +268,7 @@
  *   - 1: DeepSleep Support aktiv (typisch nur SENSOR)
  *   - 0: Dauerbetrieb
  */
-#define MR_POWERSAVE_ENABLE       1         // not at Relay and Edge, optional at Sensor
+#define MR_POWERSAVE_ENABLE       1        // not at Relay and Edge, optional at Sensor
 #define SENSOR_WAKE_PERIOD_MS     60000
 #define SENSOR_BOOT_RX_WINDOW_MS  30000
 

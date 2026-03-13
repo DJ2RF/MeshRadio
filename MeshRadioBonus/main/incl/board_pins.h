@@ -97,7 +97,7 @@
 
 // Battery divider enable (Heltec)
 #define BATT_EN_GPIO          37
-#define BATT_EN_ACTIVE_LOW     1
+#define BATT_EN_ACTIVE_LOW     0
 
 // VEXT (Heltec: LOW = ON)
 #define VEXT_CTRL_PIN         36

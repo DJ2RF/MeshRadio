@@ -24,33 +24,33 @@
 extern "C" {
 #endif
 
-static inline void call7_set(char o[7], const char *s)
+static inline void call7_set(char o[8], const char *s)
 {
-    memset(o,' ',7);
+    memset(o,' ',8);
     size_t n = s ? strlen(s) : 0;
-    if(n > 7) n = 7;
+    if(n > 8) n = 8;
     if(n) memcpy(o, s, n);
 }
 
-static inline void call7_to_str(char o[8], const char i[7])
+static inline void call7_to_str(char o[9], const char i[8])
 {
-    memcpy(o, i, 7);
-    o[7] = 0;
-    for(int k = 6; k >= 0; k--){
+    memcpy(o, i, 8);
+    o[8] = 0;
+    for(int k = 7; k >= 0; k--){
         if(o[k] == ' ') o[k] = 0;
         else break;
     }
 }
 
-static inline bool call7_eq(const char a[7], const char b[7])
+static inline bool call7_eq(const char a[8], const char b[8])
 {
-    return memcmp(a, b, 7) == 0;
+    return memcmp(a, b, 8) == 0;
 }
 
-static inline bool call7_is_wild(const char a[7])
+static inline bool call7_is_wild(const char a[8])
 {
     return (a[0]=='*' && a[1]==' ' && a[2]==' ' && a[3]==' ' &&
-            a[4]==' ' && a[5]==' ' && a[6]==' ');
+            a[4]==' ' && a[5]==' ' && a[6]==' ' && a[7]==' ');
 }
 
 #ifdef __cplusplus

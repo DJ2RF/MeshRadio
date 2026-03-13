@@ -9,14 +9,21 @@ Live monitoring and control console for MeshRadio nodes.
 
 Features
 --------
-Live WX plot
-Battery monitoring
-Command console
-Auto command on next AWAKE
-Link Quality display (based on RSSI)
-Node list with last seen timestamps
-TX window protection
-Help button with online documentation link
+- Live plots for:
+    * Temperature
+    * Pressure
+    * Humidity
+    * Battery voltage (mV)
+    * Battery charge (%)
+    * RSSI
+    * Link Quality
+- Battery monitoring
+- Command console
+- Auto command on next AWAKE
+- Link Quality display (based on RSSI)
+- Node list with last seen timestamps
+- TX window protection
+- Help button with online documentation link
 
 Author
 ------
@@ -43,33 +50,47 @@ import serial
 
 import matplotlib
 matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import tkinter as tk
 from tkinter import ttk
 
-VERSION = "MRVIS v1.0 (c) nerdverlag.com"
+
+VERSION = "MRVIS v2.0 (c) nerdverlag.com"
 HELP_URL = "https://nerdverlag.com/?page_id=719"
+
+# ---------------------------------------------------------------------
+# Regex / Parser
+# ---------------------------------------------------------------------
 
 # AWAKE must trigger in all cases, with or without WX payload
 AWAKE_RE = re.compile(r"\bSENSOR:AWAKE\b", re.IGNORECASE)
 
+# Robust WX parser:
+# Allows extra fields before/between values as long as the expected fields exist.
 WX_RE = re.compile(
-    r"SENSOR:AWAKE(?:\s+WX\s+|\s+.*?\bWX\s+)"
-    r"t=(?P<t>-?\d+(?:\.\d+)?)C\s+"
-    r"p=(?P<p>\d+)hPa\s+"
-    r"rh=(?P<rh>\d+(?:\.\d+)?)%\s+"
-    r"bat=(?P<bat_mv>\d+)mV\s+"
+    r"SENSOR:AWAKE.*?WX.*?"
+    r"t=(?P<t>-?\d+(?:\.\d+)?)C.*?"
+    r"p=(?P<p>\d+)hPa.*?"
+    r"rh=(?P<rh>\d+(?:\.\d+)?)%.*?"
+    r"bat=(?P<bat_mv>\d+)mV.*?"
     r"bat=(?P<bat_pct>\d+)%",
     re.IGNORECASE,
 )
 
-# Robust RSSI anywhere in the line
+# RSSI can appear anywhere in the line
 RSSI_RE = re.compile(r"\b(?:RSSI|rssi)\s*[:=]\s*(?P<rssi>-?\d+)\b")
 
-# Sender callsign for node list (supports: from=DL1ABCF, from:DL1ABCF)
-FROM_RE = re.compile(r"\bfrom\s*[:=]\s*(?P<call>[A-Za-z0-9/]+)\b")
+# Sender node/callsign for node list
+# "-" is explicitly allowed so names like DJ2RF-01 are not truncated.
+FROM_RE = re.compile(r"\bfrom\s*[:=]\s*(?P<call>[A-Za-z0-9/_-]+)")
 
+
+# ---------------------------------------------------------------------
+# CLI arguments
+# ---------------------------------------------------------------------
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -77,11 +98,15 @@ def parse_args():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--timeout", type=float, default=0.2)
     ap.add_argument("--window", type=int, default=30)
-    ap.add_argument("--dst", default="DL1ABCF")
+    ap.add_argument("--dst", default="DL1ABCF-1")
     ap.add_argument("--max-points", type=int, default=300)
     ap.add_argument("--always-allow-tx", action="store_true")
     return ap.parse_args()
 
+
+# ---------------------------------------------------------------------
+# Shared application state
+# ---------------------------------------------------------------------
 
 class Shared:
     def __init__(self, max_points: int):
@@ -89,8 +114,14 @@ class Shared:
         self.running = True
         self.ser = None
 
+        # Sample format:
+        # (ts, t_c, p_hpa, rh, mv, pct, rssi, lq)
         self.samples = deque(maxlen=max_points)
+
+        # Last sample format:
+        # (ts, t_c, p_hpa, rh, mv, pct, rssi, lq, raw_line)
         self.last_sample = None
+
         self.last_awake_ts = None
 
         self.auto_armed = False
@@ -99,18 +130,23 @@ class Shared:
         self.auto_last_sent_ts = None
         self.auto_last_sent_payload = ""
 
-        # Link metrics (last known)
+        # Last known RSSI
         self.last_rssi = None
 
-        # Node list: call -> {"last_seen": datetime, "rssi": int|None, "last_line": str}
+        # Node table:
+        # call -> {"last_seen": datetime, "rssi": int|None, "last_line": str}
         self.nodes = {}
 
 
 S: Shared | None = None
 
 
+# ---------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------
+
 def make_send_cmd(dst: str, ack: int, payload: str) -> str:
-    dst = (dst or "").strip() or "DL1ABCF"
+    dst = (dst or "").strip() or "DL1ABCF-1"
     ack = 1 if ack else 0
     payload = (payload or "").strip()
     return f"send {dst} {ack} {payload}"
@@ -119,13 +155,17 @@ def make_send_cmd(dst: str, ack: int, payload: str) -> str:
 def send_cli_line(line: str) -> bool:
     global S
     assert S is not None
+
     with S.lock:
         ser = S.ser
+
     if not ser:
         print("[WARN] Serial not ready")
         return False
+
     if not line.endswith("\n"):
         line += "\n"
+
     try:
         ser.write(line.encode("utf-8"))
         ser.flush()
@@ -139,30 +179,46 @@ def send_cli_line(line: str) -> bool:
 def tx_window_ok(window_s: int) -> tuple[bool, int]:
     global S
     assert S is not None
+
     with S.lock:
         t0 = S.last_awake_ts
+
     if not t0:
-        return (False, 0)
+        return False, 0
+
     age = (dt.datetime.now() - t0).total_seconds()
     left = max(0, int(window_s - age))
-    return (age <= window_s, left)
+    return age <= window_s, left
 
 
 def rssi_to_quality(rssi: int | None) -> tuple[int | None, str]:
+    """
+    Map RSSI roughly to a 0..100% link quality.
+
+    -120 dBm -> 0%
+    -30 dBm  -> 100%
+    """
     if rssi is None:
         return None, "—"
+
     lo, hi = -120.0, -30.0
     q = int(round((float(rssi) - lo) * 100.0 / (hi - lo)))
     q = max(0, min(100, q))
+
     blocks = 10
     filled = int(round(q / 100 * blocks))
     bar = "█" * filled + "░" * (blocks - filled)
     return q, bar
 
 
+# ---------------------------------------------------------------------
+# Serial reader thread
+# ---------------------------------------------------------------------
+
 def serial_reader(args):
     global S
     assert S is not None
+
     try:
         ser = serial.Serial(args.port, args.baud, timeout=args.timeout)
     except Exception as e:
@@ -173,6 +229,7 @@ def serial_reader(args):
 
     with S.lock:
         S.ser = ser
+
     print(f"[OK] {VERSION} listening on {args.port} @ {args.baud}")
 
     while True:
@@ -193,7 +250,9 @@ def serial_reader(args):
         if not line:
             continue
 
-        # Must trigger on every AWAKE, even if no WX data follows
+        # Debugging if needed:
+        # print(f"[RX] {line}")
+
         awake = AWAKE_RE.search(line)
         wxm = WX_RE.search(line)
 
@@ -201,7 +260,7 @@ def serial_reader(args):
         if not awake and not wxm:
             continue
 
-        # Optional RSSI anywhere in the line
+        # Optional RSSI
         rssi = None
         rm = RSSI_RE.search(line)
         if rm:
@@ -210,7 +269,7 @@ def serial_reader(args):
             except Exception:
                 rssi = None
 
-        # Optional node callsign for node list
+        # Optional node/callsign
         call = None
         fm = FROM_RE.search(line)
         if fm:
@@ -222,11 +281,11 @@ def serial_reader(args):
         auto_payload = ""
 
         with S.lock:
-            # Every AWAKE opens the TX window / arms the trigger condition
+            # Every AWAKE opens the TX window
             if awake:
                 S.last_awake_ts = ts
 
-            # Only update RSSI if present
+            # Update last known RSSI if present
             if rssi is not None:
                 S.last_rssi = rssi
 
@@ -236,12 +295,13 @@ def serial_reader(args):
                 if ent is None:
                     ent = {"last_seen": ts, "rssi": None, "last_line": ""}
                     S.nodes[call] = ent
+
                 ent["last_seen"] = ts
                 if rssi is not None:
                     ent["rssi"] = rssi
                 ent["last_line"] = line
 
-            # WX data is optional; only store sample if fully present
+            # Store a full WX sample if available
             if wxm:
                 t_c = float(wxm.group("t"))
                 p_hpa = int(wxm.group("p"))
@@ -249,10 +309,15 @@ def serial_reader(args):
                 mv = int(wxm.group("bat_mv"))
                 pct = int(wxm.group("bat_pct"))
 
-                S.last_sample = (ts, t_c, p_hpa, rh, mv, pct, line)
-                S.samples.append((ts, t_c, p_hpa, rh, mv, pct))
+                # For history keep RSSI from this line if present,
+                # otherwise the last known RSSI.
+                hist_rssi = rssi if rssi is not None else S.last_rssi
+                lq, _ = rssi_to_quality(hist_rssi)
 
-            # Auto command must fire on ANY AWAKE
+                S.last_sample = (ts, t_c, p_hpa, rh, mv, pct, hist_rssi, lq, line)
+                S.samples.append((ts, t_c, p_hpa, rh, mv, pct, hist_rssi, lq))
+
+            # Auto command fires on ANY AWAKE
             if awake and S.auto_armed and S.auto_payload.strip():
                 do_auto = True
                 auto_payload = S.auto_payload.strip()
@@ -273,36 +338,114 @@ def serial_reader(args):
         pass
 
 
-def start_plot_window():
-    plt.ion()
-    fig = plt.figure(figsize=(11.5, 6.5))
-    fig.canvas.manager.set_window_title(f"MeshRadio WX Plot — {VERSION}")
+# ---------------------------------------------------------------------
+# Plot window (embedded Matplotlib inside Tk Toplevel)
+# ---------------------------------------------------------------------
 
-    ax1 = fig.add_subplot(2, 1, 1)
-    ax2 = fig.add_subplot(2, 1, 2)
+def start_plot_window(root):
+    """
+    Create a normal Tk child window for plots.
 
-    (ln_t,) = ax1.plot([], [], label="Temp (°C)")
-    (ln_p,) = ax1.plot([], [], label="Pressure (hPa)")
-    ax1.grid(True)
-    ax1.legend(loc="upper left")
+    This avoids the common behavior of a separate Matplotlib top-level
+    window jumping to the foreground on some systems.
+    """
+    global S
+    assert S is not None
 
-    (ln_rh,) = ax2.plot([], [], label="RH (%)")
-    (ln_mv,) = ax2.plot([], [], label="Battery (mV)")
-    ax2.grid(True)
+    win = tk.Toplevel(root)
+    win.title(f"MeshRadio WX Plot — {VERSION}")
+    win.geometry("1500x900")
 
-    ax2r = ax2.twinx()
-    (ln_pct,) = ax2r.plot([], [], label="Battery (%)")
-    ax2r.set_ylim(0, 100)
+    # Explicitly do NOT force topmost
+    try:
+        win.attributes("-topmost", False)
+    except Exception:
+        pass
 
-    ax2.legend(
-        [ln_rh, ln_mv, ln_pct],
-        [ln_rh.get_label(), ln_mv.get_label(), ln_pct.get_label()],
-        loc="upper left",
-    )
+    fig = Figure(figsize=(15, 9), dpi=100)
+    gs = fig.add_gridspec(3, 3)
+
+    # First row: Temp | Pressure | Humidity
+    ax_t = fig.add_subplot(gs[0, 0])
+    ax_p = fig.add_subplot(gs[0, 1])
+    ax_rh = fig.add_subplot(gs[0, 2])
+
+    # Second row: Batt mV | Batt %
+    ax_mv = fig.add_subplot(gs[1, 0])
+    ax_pct = fig.add_subplot(gs[1, 1])
+    ax_empty_1 = fig.add_subplot(gs[1, 2])
+
+    # Third row: RSSI | Link Quality
+    ax_rssi = fig.add_subplot(gs[2, 0])
+    ax_lq = fig.add_subplot(gs[2, 1])
+    ax_empty_2 = fig.add_subplot(gs[2, 2])
+
+    ax_empty_1.axis("off")
+    ax_empty_2.axis("off")
+
+    (ln_t,) = ax_t.plot([], [], label="Temperature (°C)")
+    (ln_p,) = ax_p.plot([], [], label="Pressure (hPa)")
+    (ln_rh,) = ax_rh.plot([], [], label="Humidity (%)")
+    (ln_mv,) = ax_mv.plot([], [], label="Battery (mV)")
+    (ln_pct,) = ax_pct.plot([], [], label="Battery (%)")
+    (ln_rssi,) = ax_rssi.plot([], [], label="RSSI (dBm)")
+    (ln_lq,) = ax_lq.plot([], [], label="Link Quality (%)")
+
+    all_axes = (ax_t, ax_p, ax_rh, ax_mv, ax_pct, ax_rssi, ax_lq)
+
+    for ax in all_axes:
+        ax.grid(True)
+        ax.legend(loc="upper left")
+
+    ax_t.set_ylabel("°C")
+    ax_p.set_ylabel("hPa")
+    ax_rh.set_ylabel("%")
+    ax_mv.set_ylabel("mV")
+    ax_pct.set_ylabel("%")
+    ax_rssi.set_ylabel("dBm")
+    ax_lq.set_ylabel("%")
+
+    ax_mv.set_xlabel("Time (s)")
+    ax_pct.set_xlabel("Time (s)")
+    ax_rssi.set_xlabel("Time (s)")
+    ax_lq.set_xlabel("Time (s)")
+
+    ax_pct.set_ylim(0, 100)
+    ax_lq.set_ylim(0, 100)
+
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas_widget = canvas.get_tk_widget()
+    canvas_widget.pack(fill="both", expand=True)
+
+    # Allows plot window to be closed independently
+    closed = {"value": False}
+
+    def on_close():
+        closed["value"] = True
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
 
     def update():
         global S
         assert S is not None
+
+        if closed["value"]:
+            return
+
+        try:
+            exists = win.winfo_exists()
+        except Exception:
+            exists = False
+
+        if not exists:
+            return
+
         with S.lock:
             sam = list(S.samples)
             last = S.last_sample
@@ -312,17 +455,29 @@ def start_plot_window():
             t0 = sam[0][0]
             xs = [(x[0] - t0).total_seconds() for x in sam]
 
-            ln_t.set_data(xs, [x[1] for x in sam])
-            ln_p.set_data(xs, [x[2] for x in sam])
-            ln_rh.set_data(xs, [x[3] for x in sam])
-            ln_mv.set_data(xs, [x[4] for x in sam])
-            ln_pct.set_data(xs, [x[5] for x in sam])
+            ys_t = [x[1] for x in sam]
+            ys_p = [x[2] for x in sam]
+            ys_rh = [x[3] for x in sam]
+            ys_mv = [x[4] for x in sam]
+            ys_pct = [x[5] for x in sam]
+            ys_rssi = [x[6] if x[6] is not None else float("nan") for x in sam]
+            ys_lq = [x[7] if x[7] is not None else float("nan") for x in sam]
 
-            ax1.relim()
-            ax1.autoscale_view()
-            ax2.relim()
-            ax2.autoscale_view()
-            ax2.set_xlabel("Time (s)")
+            ln_t.set_data(xs, ys_t)
+            ln_p.set_data(xs, ys_p)
+            ln_rh.set_data(xs, ys_rh)
+            ln_mv.set_data(xs, ys_mv)
+            ln_pct.set_data(xs, ys_pct)
+            ln_rssi.set_data(xs, ys_rssi)
+            ln_lq.set_data(xs, ys_lq)
+
+            for ax in all_axes:
+                ax.relim()
+                ax.autoscale_view()
+
+            # Fixed logical limits
+            ax_pct.set_ylim(0, 100)
+            ax_lq.set_ylim(0, 100)
 
             if last:
                 q, bar = rssi_to_quality(lrssi)
@@ -332,31 +487,38 @@ def start_plot_window():
 
                 fig.suptitle(
                     f"{last[0].strftime('%H:%M:%S')}  "
-                    f"T={last[1]:.2f}°C  P={last[2]}hPa  RH={last[3]:.2f}%  "
+                    f"T={last[1]:.2f}°C  "
+                    f"P={last[2]}hPa  "
+                    f"RH={last[3]:.2f}%  "
                     f"BAT={last[4]}mV ({last[5]}%)"
                     f"{link_txt}",
                     fontsize=12,
                 )
 
-        fig.canvas.draw_idle()
-        plt.pause(0.001)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    return fig, update
+        canvas.draw_idle()
+
+    return win, update
 
 
-def start_control_window(args):
+# ---------------------------------------------------------------------
+# Control window (main Tk root)
+# ---------------------------------------------------------------------
+
+def start_control_window(args, root):
     global S
     assert S is not None
 
-    root = tk.Tk()
     root.title(f"MeshRadio Control Panel — {VERSION}")
 
+    # ---------------- Top: TX window indicator ----------------
     frmTop = ttk.Frame(root, padding=10)
     frmTop.grid(row=0, column=0, sticky="ew")
 
-    canvas = tk.Canvas(frmTop, width=40, height=40, highlightthickness=0)
-    canvas.grid(row=0, column=0, rowspan=2, padx=(0, 10))
-    lamp = canvas.create_oval(5, 5, 35, 35, fill="grey", outline="black")
+    lamp_canvas = tk.Canvas(frmTop, width=40, height=40, highlightthickness=0)
+    lamp_canvas.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+    lamp = lamp_canvas.create_oval(5, 5, 35, 35, fill="grey", outline="black")
 
     ttk.Label(frmTop, text=f"TX window ({args.window}s):", font=("Segoe UI", 11)).grid(
         row=0, column=1, sticky="w"
@@ -364,12 +526,13 @@ def start_control_window(args):
     lblCnt = ttk.Label(frmTop, text="—", font=("Segoe UI", 12, "bold"))
     lblCnt.grid(row=1, column=1, sticky="w")
 
+    # ---------------- Manual send area ----------------
     frmMid = ttk.Frame(root, padding=10)
     frmMid.grid(row=1, column=0, sticky="ew")
 
     ttk.Label(frmMid, text="DST:").grid(row=0, column=0, sticky="w")
     varDst = tk.StringVar(value=args.dst)
-    ttk.Entry(frmMid, textvariable=varDst, width=12).grid(
+    ttk.Entry(frmMid, textvariable=varDst, width=14).grid(
         row=0, column=1, sticky="w", padx=(6, 12)
     )
 
@@ -380,9 +543,11 @@ def start_control_window(args):
     )
     frmMid.columnconfigure(3, weight=1)
 
+    # ---------------- Quick buttons ----------------
     frmBot = ttk.Frame(root, padding=10)
     frmBot.grid(row=2, column=0, sticky="ew")
 
+    # ---------------- Auto one-shot ----------------
     frmAuto = ttk.LabelFrame(
         root, text="One-shot Auto Command (sent ONCE on next AWAKE)", padding=10
     )
@@ -393,7 +558,8 @@ def start_control_window(args):
 
     def set_status(msg: str, ok: bool = True):
         lblStatus.config(
-            text=f"status: {msg}", foreground=("#228822" if ok else "#aa3333")
+            text=f"status: {msg}",
+            foreground=("#228822" if ok else "#aa3333"),
         )
 
     def open_help():
@@ -413,8 +579,10 @@ def start_control_window(args):
         full = make_send_cmd(dst, 1, payload)
 
         if args.always_allow_tx:
-            send_cli_line(full)
-            set_status(f"sent (ACK=1) to {dst}: {payload}", ok=True)
+            if send_cli_line(full):
+                set_status(f"sent (ACK=1) to {dst}: {payload}", ok=True)
+            else:
+                set_status("TX failed (serial not ready?)", ok=False)
             return
 
         ok, _left = tx_window_ok(args.window)
@@ -427,9 +595,11 @@ def start_control_window(args):
         else:
             set_status("TX failed (serial not ready?)", ok=False)
 
-    ttk.Button(frmMid, text="SEND (ACK=1)", command=lambda: guarded_send(varPay.get())).grid(
-        row=0, column=4, sticky="e", padx=(0, 6)
-    )
+    ttk.Button(
+        frmMid,
+        text="SEND (ACK=1)",
+        command=lambda: guarded_send(varPay.get())
+    ).grid(row=0, column=4, sticky="e", padx=(0, 6))
 
     ttk.Button(frmMid, text="HELP", command=open_help).grid(
         row=0, column=5, sticky="e"
@@ -449,9 +619,23 @@ def start_control_window(args):
         b.grid(row=0, column=i, sticky="ew", padx=5)
         frmBot.columnconfigure(i, weight=1)
 
-    varAuto = tk.StringVar(value="")
-    entAuto = ttk.Entry(frmAuto, textvariable=varAuto, width=55)
-    entAuto.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+    # Auto commands as selectable dropdown
+    AUTO_COMMANDS = [
+        "CMD:RELAY ON",
+        "CMD:RELAY OFF",
+        "CMD:RELAY TOGGLE",
+    ]
+
+    varAuto = tk.StringVar(value=AUTO_COMMANDS[0])
+
+    cmbAuto = ttk.Combobox(
+        frmAuto,
+        textvariable=varAuto,
+        values=AUTO_COMMANDS,
+        state="readonly",
+        width=30,
+    )
+    cmbAuto.grid(row=0, column=0, sticky="ew", padx=(0, 10))
     frmAuto.columnconfigure(0, weight=1)
 
     lblAutoState = tk.Label(frmAuto, text="DISARMED", bg="#aa3333", fg="white", width=26)
@@ -463,6 +647,7 @@ def start_control_window(args):
     lblLog = ttk.Label(frmAuto, text="log: (none)")
     lblLog.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
+    # ---------------- Link summary ----------------
     frmLink = ttk.Frame(root, padding=10)
     frmLink.grid(row=4, column=0, sticky="ew")
 
@@ -471,6 +656,7 @@ def start_control_window(args):
     lblLink.grid(row=0, column=1, sticky="w", padx=(6, 0))
     frmLink.columnconfigure(1, weight=1)
 
+    # ---------------- Node table ----------------
     frmNodes = ttk.LabelFrame(root, text="Nodes (last seen)", padding=10)
     frmNodes.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
     root.grid_rowconfigure(5, weight=1)
@@ -478,14 +664,15 @@ def start_control_window(args):
 
     cols = ("call", "last_seen", "rssi", "lq")
     tv = ttk.Treeview(frmNodes, columns=cols, show="headings", height=7)
+
     tv.heading("call", text="Node")
     tv.heading("last_seen", text="Last seen")
     tv.heading("rssi", text="RSSI")
     tv.heading("lq", text="LQ")
 
-    tv.column("call", width=120, anchor="w")
+    tv.column("call", width=180, anchor="w", stretch=True)
     tv.column("last_seen", width=90, anchor="e")
-    tv.column("rssi", width=80, anchor="e")
+    tv.column("rssi", width=90, anchor="e")
     tv.column("lq", width=180, anchor="w")
 
     vsb = ttk.Scrollbar(frmNodes, orient="vertical", command=tv.yview)
@@ -514,27 +701,25 @@ def start_control_window(args):
         sent_until["ts"] = dt.datetime.now() + dt.timedelta(seconds=3)
 
     def arm_auto():
-        raw_entry = entAuto.get()
-        raw_var = varAuto.get()
-        cmd = (raw_entry or "").strip()
+        selected = varAuto.get().strip()
 
-        lblLog.config(text=f"log: ARM clicked, ent='{raw_entry}', var='{raw_var}'")
-        print(f"[UI] ARM click, ent='{raw_entry}', var='{raw_var}'")
+        lblLog.config(text=f"log: ARM clicked, selected='{selected}'")
+        print(f"[UI] ARM click, selected='{selected}'")
 
-        if not cmd:
+        if not selected:
             lblDbg.config(text="debug: auto_armed=0 (no cmd)")
-            set_status("auto command is empty (enter e.g. CMD:RELAY ON)", ok=False)
+            set_status("auto command is empty", ok=False)
             return
 
         with S.lock:
-            S.auto_payload = cmd
+            S.auto_payload = selected
             S.auto_armed = True
             S.auto_last_sent_ts = None
             S.auto_last_sent_payload = ""
 
         ui_set_armed()
         lblDbg.config(text="debug: auto_armed=1 (ARM OK)")
-        set_status(f"ARMED: will send once on next AWAKE → '{cmd}'", ok=True)
+        set_status(f"ARMED: will send once on next AWAKE → '{selected}'", ok=True)
 
     def disarm_auto():
         lblLog.config(text="log: DISARM clicked")
@@ -548,35 +733,31 @@ def start_control_window(args):
         lblDbg.config(text="debug: auto_armed=0 (DISARM OK)")
         set_status("DISARMED", ok=True)
 
-    btnArm = ttk.Button(frmAuto, text="ARM (next AWAKE)")
+    btnArm = ttk.Button(frmAuto, text="ARM (next AWAKE)", command=arm_auto)
     btnArm.grid(row=1, column=0, sticky="w", pady=(8, 0))
 
-    btnDisarm = ttk.Button(frmAuto, text="DISARM")
+    btnDisarm = ttk.Button(frmAuto, text="DISARM", command=disarm_auto)
     btnDisarm.grid(row=1, column=1, sticky="e", pady=(8, 0))
-
-    btnArm.configure(command=arm_auto)
-    btnDisarm.configure(command=disarm_auto)
-    btnArm.bind("<Button-1>", lambda e: arm_auto())
-    btnDisarm.bind("<Button-1>", lambda e: disarm_auto())
-
-    ui_set_disarmed()
 
     def refresh_nodes_table(nodes_snapshot: dict):
         now = dt.datetime.now()
-
         rows = []
+
         for call, ent in nodes_snapshot.items():
             last_seen = ent.get("last_seen")
             rssi = ent.get("rssi")
+
             age_s = 10**9
             if isinstance(last_seen, dt.datetime):
                 age_s = int((now - last_seen).total_seconds())
                 last_txt = f"{age_s}s"
             else:
                 last_txt = "—"
+
             q, bar = rssi_to_quality(rssi if isinstance(rssi, int) else None)
             rssi_txt = f"{rssi}dBm" if isinstance(rssi, int) else "—"
             lq_txt = f"{q}% {bar}" if q is not None else "—"
+
             rows.append((call, last_txt, rssi_txt, lq_txt, age_s))
 
         rows.sort(key=lambda x: x[4])
@@ -601,10 +782,10 @@ def start_control_window(args):
     def tick():
         ok, left = tx_window_ok(args.window)
         if ok:
-            canvas.itemconfig(lamp, fill="green")
+            lamp_canvas.itemconfig(lamp, fill="green")
             lblCnt.config(text=f"{left}s (open)")
         else:
-            canvas.itemconfig(lamp, fill="grey")
+            lamp_canvas.itemconfig(lamp, fill="grey")
             lblCnt.config(text="closed")
 
         with S.lock:
@@ -657,27 +838,45 @@ def start_control_window(args):
     return root
 
 
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
 def main():
     global S
     args = parse_args()
     S = Shared(max_points=args.max_points)
 
+    root = tk.Tk()
+
+    # Start serial thread
     th = threading.Thread(target=serial_reader, args=(args,), daemon=True)
     th.start()
 
-    fig, plot_update = start_plot_window()
-    root = start_control_window(args)
+    # Create main control window on root
+    start_control_window(args, root)
+
+    # Create plot window as normal child window
+    plot_win, plot_update = start_plot_window(root)
 
     def plot_tick():
         with S.lock:
             running = S.running
+
         if not running:
             try:
-                plt.close(fig)
+                if plot_win.winfo_exists():
+                    plot_win.destroy()
             except Exception:
                 pass
             return
-        plot_update()
+
+        try:
+            if plot_win.winfo_exists():
+                plot_update()
+        except Exception:
+            pass
+
         root.after(200, plot_tick)
 
     plot_tick()

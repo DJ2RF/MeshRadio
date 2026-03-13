@@ -7,12 +7,13 @@
     "--compile-commands-dir=d:\\mesh-radio_Repo\\MeshRadioBonus\\build"
   ],
   "idf.currentSetup": "C:\\Users\\Fritz\\esp\\v5.5.2\\esp-idf",
-  "idf.portWin": "COM16",
+  "idf.portWin": "COM17",
   "idf.openOcdConfigs": [
-    "board/esp32s3-builtin.cfg"
+    "interface/ftdi/esp32_devkitj_v1.cfg",
+    "target/esp32.cfg"
   ],
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32s3"
+    "IDF_TARGET": "esp32"
   },
   "idf.flashType": "UART"
 }

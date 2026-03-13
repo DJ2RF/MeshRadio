@@ -61,19 +61,18 @@ static inline void sec_make_aad(mr_aad_v7_t *a, const mr_hdr_v7_t *h)
     a->flags   = h->flags;
     a->msg_id  = h->msg_id;
     a->seq     = h->seq;
-    memcpy(a->src, h->src, 7);
-    memcpy(a->final_dst, h->final_dst, 7);
+    memcpy(a->src, h->src, 8);
+    memcpy(a->final_dst, h->final_dst, 8);
     a->payload_len = h->payload_len;
 }
 
 static inline void sec_make_nonce(uint8_t nonce[SEC_NONCE_LEN], const mr_hdr_v7_t *h)
 {
-    memcpy(nonce, h->src, 7);
-    nonce[7]  = (uint8_t)(h->seq & 0xFF);
-    nonce[8]  = (uint8_t)(h->seq >> 8);
-    nonce[9]  = (uint8_t)(h->msg_id & 0xFF);
-    nonce[10] = (uint8_t)(h->msg_id >> 8);
-    nonce[11] = (uint8_t)MR_NET_ID;
+    memcpy(&nonce[0], h->src, 8);
+    nonce[8]  = (uint8_t)(h->seq & 0xFF);
+    nonce[9]  = (uint8_t)(h->seq >> 8);
+    nonce[10] = (uint8_t)(h->msg_id & 0xFF);
+    nonce[11] = (uint8_t)(h->msg_id >> 8);
 }
 
 static inline bool sec_encrypt_payload(const mr_hdr_v7_t *h,

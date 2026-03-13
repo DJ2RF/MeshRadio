@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 // ================================ PROTOKOLL =================================
-#define MR_PROTO_VERSION 7
+#define MR_PROTO_VERSION 8
 
 #define MR_FLAG_DATA      0x10
 #define MR_FLAG_BEACON    0x20
@@ -52,7 +52,7 @@ extern "C" {
 #define MAX_ROUTES 32
 #define ROUTE_TIMEOUT_MS 180000
 #define MAX_PENDING_ACK  10
-#define ROUTEADV_PL_LEN   (7+7+2+2)
+#define ROUTEADV_PL_LEN   (8+8+2+2)
 #define MAX_REPLAY 24
 
 // LoRa TX timeout (für beide Chips)
@@ -70,10 +70,10 @@ typedef struct {
 
     uint16_t seq;
 
-    char src[7];
-    char final_dst[7];
-    char next_hop[7];
-    char last_hop[7];
+    char src[8];
+    char final_dst[8];
+    char next_hop[8];
+    char last_hop[8];
 
     uint8_t payload_len;
 } mr_hdr_v7_t;
@@ -81,14 +81,15 @@ typedef struct {
 
 // FIXED AAD für CCM (stabil, unabhängig von forwarding Feldern)
 #pragma pack(push,1)
+// mr_proto_v7.h
 typedef struct {
     uint8_t magic[2];
     uint8_t version;
     uint8_t flags;
     uint16_t msg_id;
     uint16_t seq;
-    char src[7];
-    char final_dst[7];
+    char src[8];
+    char final_dst[8];
     uint8_t payload_len;
 } mr_aad_v7_t;
 #pragma pack(pop)

@@ -40,7 +40,8 @@
 #include "incl/mr_call7.h"
 #include "incl/mr_bucket.h"
 #include "incl/mr_sec_ccm.h"
-
+#include "incl/mr_wifi_sta.h"
+#include "incl/mr_wifi_ota.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -62,6 +63,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_netif.h"
+#include "lwip/ip4_addr.h"
 
 #include "esp_log.h"
 #include "esp_random.h"
@@ -82,7 +85,7 @@
 // ============================================================================
 // ================================ PROTOKOLL =================================
 // ============================================================================
-#define MR_PROTO_VERSION 7
+#define MR_PROTO_VERSION 8
 
 #define MR_FLAG_DATA      0x10
 #define MR_FLAG_BEACON    0x20
@@ -106,7 +109,7 @@
 #define MAX_ROUTES 32
 #define ROUTE_TIMEOUT_MS 180000
 #define MAX_PENDING_ACK  10
-#define ROUTEADV_PL_LEN   (7+7+2+2)
+#define ROUTEADV_PL_LEN   (8+8+2+2)
 #define MAX_REPLAY 24
 
 // LoRa TX timeout (für beide Chips)
@@ -140,11 +143,11 @@ static const char* node_mode_str(node_mode_t m)
 // ============================================================================
 // ================================ STRUCTS ===================================
 // ============================================================================
-typedef struct { bool used; char src[7]; uint16_t id; } seen_t;
+typedef struct { bool used; char src[8]; uint16_t id; } seen_t;
 
 typedef struct {
     bool used;
-    char call[7];
+    char call[8];
     int rssi;
     uint32_t t_ms;
     uint32_t tx_attempts;
@@ -154,8 +157,8 @@ typedef struct {
 
 typedef struct {
     bool used;
-    char dst[7];
-    char next[7];
+    char dst[8];
+    char next[8];
     uint16_t seq;
     uint16_t etx_x100;
     int last_rssi;
@@ -166,7 +169,7 @@ typedef struct {
 typedef struct {
     bool used;
     uint16_t msg_id;
-    char expect_from[7];
+    char expect_from[8];
     uint32_t deadline_ms;
     uint8_t retries_left;
     uint8_t frame[sizeof(mr_hdr_v7_t) + MAX_PAYLOAD];
@@ -176,7 +179,7 @@ typedef struct {
 typedef struct {
     bool used;
     bool has_seq;
-    char src[7];
+    char src[8];
     uint16_t last_seq;
     uint32_t t_ms;
 } replay_t;
@@ -189,10 +192,13 @@ static const char *TAG="MR34";
 
 #include "incl/mr_cfg.h"
 
+void wifi_enable_ap_part(void);
+void wifi_disable_ap_part(void);
+
 int8_t g_relay_gpio_runtime = RELAY_GPIO;
 
-char g_callsign_rt[8] = MR_CALLSIGN;
-char g_relay_callsign_rt[8] = MR_RELAY_CALLSIGN;
+char g_callsign_rt[9] = MR_CALLSIGN;
+char g_relay_callsign_rt[9] = MR_RELAY_CALLSIGN;
 
 
 // runtime RF (statt nur DEFAULT_RF_FREQ_HZ Makro)
@@ -275,8 +281,9 @@ static bucket_t b_beacon, b_routeadv, b_ack, b_data;
 
 static bool g_wifi_enabled = (MR_WIFI_RUNTIME_DEFAULT ? true : false);
 static bool g_wifi_inited  = false;
+static bool g_ap_part_enabled = false;
 
-static char g_last_rx_from[8]   = "";
+static char g_last_rx_from[9]   = "";
 static char g_last_rx_text[180] = "";
 static uint32_t g_last_rx_ms    = 0;
 
@@ -495,6 +502,7 @@ static void board_power_boot_init(void)
 #endif
     vTaskDelay(pdMS_TO_TICKS(50));
 #endif
+
 }
 
 static inline void batt_path_enable(bool en)
@@ -626,7 +634,7 @@ static bool bme280_init(void)
 
     uint8_t id=0;
     if(bme_read(BME280_REG_ID, &id, 1) != ESP_OK){
-        ESP_LOGW(TAG, "BME280: read ID failed");
+        // ESP_LOGW(TAG, "BME280: read ID failed");
         return false;
     }
     
@@ -722,7 +730,7 @@ static bool bme280_read_weather(int32_t *out_t_x100, uint32_t *out_p_pa, uint32_
 // ============================================================================
 // ================================ SEEN ======================================
 // ============================================================================
-static bool seen_before(const char src[7], uint16_t id)
+static bool seen_before(const char src[8], uint16_t id)
 {
     for(int i=0;i<SEEN_CACHE_SIZE;i++){
         if(!seen_cache[i].used) continue;
@@ -730,11 +738,11 @@ static bool seen_before(const char src[7], uint16_t id)
     }
     return false;
 }
-static void remember_msg(const char src[7], uint16_t id)
+static void remember_msg(const char src[8], uint16_t id)
 {
     static int idx=0;
     seen_cache[idx].used=true;
-    memcpy(seen_cache[idx].src,src,7);
+    memcpy(seen_cache[idx].src,src,8);
     seen_cache[idx].id=id;
     idx=(idx+1)%SEEN_CACHE_SIZE;
 }
@@ -743,7 +751,7 @@ static void remember_msg(const char src[7], uint16_t id)
 // ============================================================================
 // =============================== NEIGHBORS ==================================
 // ============================================================================
-static int neighbor_find_locked(const char call[7])
+static int neighbor_find_locked(const char call[8])
 {
     for(int i=0;i<MAX_NEIGHBORS;i++){
         if(!neighbors[i].used) continue;
@@ -751,7 +759,7 @@ static int neighbor_find_locked(const char call[7])
     }
     return -1;
 }
-static int neighbor_ensure_locked(const char call[7])
+static int neighbor_ensure_locked(const char call[8])
 {
     int idx = neighbor_find_locked(call);
     if(idx >= 0) return idx;
@@ -759,7 +767,7 @@ static int neighbor_ensure_locked(const char call[7])
     for(int i=0;i<MAX_NEIGHBORS;i++){
         if(!neighbors[i].used){
             neighbors[i].used=true;
-            memcpy(neighbors[i].call, call, 7);
+            memcpy(neighbors[i].call, call, 8);
             neighbors[i].rssi=-127;
             neighbors[i].t_ms=now_ms();
             neighbors[i].tx_attempts=0;
@@ -778,21 +786,21 @@ static void neighbor_decay_locked(neighbor_t *n)
     n->ack_ok      = (n->ack_ok + 1) / 2;
     n->last_decay_ms = t;
 }
-static void neighbor_update_rssi_locked(const char call[7], int rssi)
+static void neighbor_update_rssi_locked(const char call[8], int rssi)
 {
     int idx = neighbor_ensure_locked(call);
     if(idx < 0) return;
     neighbors[idx].rssi=rssi;
     neighbors[idx].t_ms=now_ms();
 }
-static void neighbor_tx_attempt_locked(const char call[7])
+static void neighbor_tx_attempt_locked(const char call[8])
 {
     int idx = neighbor_ensure_locked(call);
     if(idx < 0) return;
     neighbor_decay_locked(&neighbors[idx]);
     neighbors[idx].tx_attempts++;
 }
-static void neighbor_ack_ok_locked(const char call[7])
+static void neighbor_ack_ok_locked(const char call[8])
 {
     int idx = neighbor_ensure_locked(call);
     if(idx < 0) return;
@@ -817,13 +825,12 @@ static bool holddown_active_locked(route_t *r)
     uint32_t t=now_ms();
     return (t < r->hold_until_ms);
 }
-static void route_update_locked(const char dst[7],
-                                const char next[7],
+static void route_update_locked(const char dst[8],                                const char next[8],
                                 uint16_t seq,
                                 uint16_t etx_x100,
                                 int last_rssi)
 {
-    char me[7]; call7_set(me, g_callsign_rt);
+    char me[8]; call7_set(me, g_callsign_rt);
     if(call7_eq(next, me)) return;
 
     uint32_t t=now_ms();
@@ -845,7 +852,7 @@ static void route_update_locked(const char dst[7],
 
         if(replace){
             bool next_changed = !call7_eq(routes[i].next, next);
-            memcpy(routes[i].next, next, 7);
+            memcpy(routes[i].next, next, 8);
             routes[i].seq = seq;
             routes[i].etx_x100 = etx_x100;
             routes[i].last_rssi = last_rssi;
@@ -860,8 +867,8 @@ static void route_update_locked(const char dst[7],
     for(int i=0;i<MAX_ROUTES;i++){
         if(!routes[i].used){
             routes[i].used=true;
-            memcpy(routes[i].dst, dst, 7);
-            memcpy(routes[i].next, next, 7);
+            memcpy(routes[i].dst, dst, 8);
+            memcpy(routes[i].next, next, 8);
             routes[i].seq=seq;
             routes[i].etx_x100=etx_x100;
             routes[i].last_rssi=last_rssi;
@@ -871,14 +878,14 @@ static void route_update_locked(const char dst[7],
         }
     }
 }
-static bool route_lookup_locked(const char dst[7], char out_next[7])
+static bool route_lookup_locked(const char dst[8], char out_next[8])
 {
     uint32_t t=now_ms();
     for(int i=0;i<MAX_ROUTES;i++){
         if(!routes[i].used) continue;
         if(!call7_eq(routes[i].dst, dst)) continue;
         if(t - routes[i].t_ms > ROUTE_TIMEOUT_MS) return false;
-        memcpy(out_next, routes[i].next, 7);
+        memcpy(out_next, routes[i].next, 8);
         return true;
     }
     return false;
@@ -896,7 +903,7 @@ static void route_cleanup_locked(void)
 // ============================================================================
 // ============================ REPLAY + SEQ SAFE =============================
 // ============================================================================
-static replay_t* replay_get_locked(const char src[7])
+static replay_t* replay_get_locked(const char src[8])
 {
     for(int i=0;i<MAX_REPLAY;i++){
         if(!replay_tab[i].used) continue;
@@ -906,7 +913,7 @@ static replay_t* replay_get_locked(const char src[7])
         if(!replay_tab[i].used){
             replay_tab[i].used = true;
             replay_tab[i].has_seq = false;
-            memcpy(replay_tab[i].src, src, 7);
+            memcpy(replay_tab[i].src, src, 8);
             replay_tab[i].last_seq = 0;
             replay_tab[i].t_ms = now_ms();
             return &replay_tab[i];
@@ -920,7 +927,7 @@ static replay_t* replay_get_locked(const char src[7])
     }
     replay_tab[oldest].used = true;
     replay_tab[oldest].has_seq = false;
-    memcpy(replay_tab[oldest].src, src, 7);
+    memcpy(replay_tab[oldest].src, src, 8);
     replay_tab[oldest].last_seq = 0;
     replay_tab[oldest].t_ms = now_ms();
     return &replay_tab[oldest];
@@ -929,7 +936,7 @@ static bool seq_is_newer_u16(uint16_t seq, uint16_t last_seq)
 {
     return ((int16_t)(seq - last_seq) > 0);
 }
-static bool replay_check_locked(const char src[7], uint16_t seq)
+static bool replay_check_locked(const char src[8], uint16_t seq)
 {
     replay_t *r = replay_get_locked(src);
     r->t_ms = now_ms();
@@ -941,7 +948,7 @@ static bool replay_check_locked(const char src[7], uint16_t seq)
 
     return seq_is_newer_u16(seq, r->last_seq);
 }
-static void replay_update_locked(const char src[7], uint16_t seq)
+static void replay_update_locked(const char src[8], uint16_t seq)
 {
     replay_t *r = replay_get_locked(src);
     r->last_seq = seq;
@@ -1367,10 +1374,10 @@ static void lora_init_radio(void)
     }
 
     // RF frequency:
-    ESP_LOGW(TAG, "SX1262 init RF=%lu Hz TX=%d dBm",
+    /*ESP_LOGW(TAG, "SX1262 init RF=%lu Hz TX=%d dBm",
          (unsigned long)g_rf_freq_hz_runtime,
          (int)g_tx_power_dbm_runtime);
-
+    */
     uint32_t rf = (uint32_t)(((uint64_t)g_rf_freq_hz_runtime << 25) / 32000000ULL);
     uint8_t rfcmd[5] = {
         SX126X_SET_RF_FREQUENCY,
@@ -1646,6 +1653,7 @@ static int batt_adc_gpio_to_chan(gpio_num_t gpio)
     }
     #endif
 }
+#endif
 
 #if CONFIG_IDF_TARGET_ESP32S3
 
@@ -1682,9 +1690,20 @@ static void batt_enable_hw(void)
 
 static void batt_init(void)
 {
-    // WICHTIG: Vext muss AN sein, damit der Spannungsteiler Strom bekommt
-    // Das hast du bereits im Radio-Init (GPIO 36 = 0)
     batt_enable_hw();
+
+#ifdef BATT_EN_GPIO
+    gpio_reset_pin((gpio_num_t)BATT_EN_GPIO);
+    gpio_set_direction((gpio_num_t)BATT_EN_GPIO, GPIO_MODE_OUTPUT);
+
+#if BATT_EN_ACTIVE_LOW
+    gpio_set_level((gpio_num_t)BATT_EN_GPIO, 1); // OFF
+#else
+    gpio_set_level((gpio_num_t)BATT_EN_GPIO, 0); // OFF
+#endif
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+#endif
 
     int ch = batt_adc_gpio_to_chan((gpio_num_t)BATT_ADC_GPIO);
     if(ch < 0){
@@ -1698,23 +1717,22 @@ static void batt_init(void)
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &g_adc_unit));
 
     adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = ADC_ATTEN_DB_12, // S3 nutzt 12dB für volle 3.3V Range
+        .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc_unit, (adc_channel_t)ch, &chan_cfg));
 
-    // Kalibrierung für S3 (Line Fitting ist hier Standard)
     g_adc_cali_ok = false;
-    #if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-        adc_cali_line_fitting_config_t cali_cfg = {
-            .unit_id = ADC_UNIT_1,
-            .atten = ADC_ATTEN_DB_12,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-        };
-        if (adc_cali_create_scheme_line_fitting(&cali_cfg, &g_adc_cali) == ESP_OK) {
-            g_adc_cali_ok = true;
-        }
-    #endif
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if(adc_cali_create_scheme_line_fitting(&cali_cfg, &g_adc_cali) == ESP_OK){
+        g_adc_cali_ok = true;
+    }
+#endif
 
     g_next_batt_ms = now_ms() + 500;
 }
@@ -1725,7 +1743,7 @@ static void batt_init(void)
 {
     int ch = batt_adc_gpio_to_chan((gpio_num_t)BATT_ADC_GPIO);
     if(ch < 0){
-        ESP_LOGW(TAG,"Battery ADC: GPIO%d not supported in mapping -> disabled", BATT_ADC_GPIO);
+        // ESP_LOGW(TAG,"Battery ADC: GPIO%d not supported in mapping -> disabled", BATT_ADC_GPIO);
         return;
     }
 
@@ -1754,7 +1772,7 @@ static void batt_init(void)
         if(adc_cali_create_scheme_curve_fitting(&cali_cfg, &g_adc_cali) == ESP_OK){
             g_adc_cali_ok=true;
         }else{
-            ESP_LOGW(TAG,"ADC cali (curve fitting) failed -> using raw fallback");
+            // ESP_LOGW(TAG,"ADC cali (curve fitting) failed -> using raw fallback");
         }
 #elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
         adc_cali_line_fitting_config_t cali_cfg = {
@@ -1765,10 +1783,10 @@ static void batt_init(void)
         if(adc_cali_create_scheme_line_fitting(&cali_cfg, &g_adc_cali) == ESP_OK){
             g_adc_cali_ok=true;
         }else{
-            ESP_LOGW(TAG,"ADC cali (line fitting) failed -> using raw fallback");
+            // ESP_LOGW(TAG,"ADC cali (line fitting) failed -> using raw fallback");
         }
 #else
-        ESP_LOGW(TAG,"ADC calibration not supported in this ESP-IDF build -> using raw fallback");
+        // ESP_LOGW(TAG,"ADC calibration not supported in this ESP-IDF build -> using raw fallback");
 #endif
     }
 
@@ -1784,8 +1802,6 @@ static uint32_t batt_mv_to_pct(uint32_t mv)
     uint32_t span = (uint32_t)(BATT_FULL_MV - BATT_EMPTY_MV);
     return (uint32_t)(((mv - BATT_EMPTY_MV) * 100U) / span);
 }
-
-#if MR_BATT_ENABLE
 
 #if MR_BATT_ENABLE
 static void batt_force_read_once(void)
@@ -1807,17 +1823,22 @@ static void batt_force_read_once(void)
         goto done;
     }
 
-    int raw_dummy=0; (void)adc_oneshot_read(g_adc_unit, ch, &raw_dummy);
+    int raw_dummy = 0;
+    (void)adc_oneshot_read(g_adc_unit, ch, &raw_dummy);
 
-    int raw=0;
+    int raw = 0;
     if(adc_oneshot_read(g_adc_unit, ch, &raw) != ESP_OK){
         goto done;
     }
 
-    int mv_adc=0;
+    int mv_adc = 0;
     if(g_adc_cali_ok && g_adc_cali){
         if(adc_cali_raw_to_voltage(g_adc_cali, raw, &mv_adc) != ESP_OK){
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
             mv_adc = (raw * 3300) / 4095;
+#else
+            mv_adc = 0;
+#endif
         }
     }else{
         mv_adc = (raw * 3300) / 4095;
@@ -1826,13 +1847,13 @@ static void batt_force_read_once(void)
     float scale = (BATT_DIV_RTOP_OHMS + BATT_DIV_RBOT_OHMS) / BATT_DIV_RBOT_OHMS;
     uint32_t vbat = (uint32_t)((float)mv_adc * scale * BATT_CAL_FACTOR);
 
-    ESP_LOGW(TAG, "BATT DBG raw=%d mv_adc=%d scale=%.3f cal=%.3f vbat=%lu",
-         raw,
-         mv_adc,
-         (double)scale,
-         (double)BATT_CAL_FACTOR,
-         (unsigned long)vbat);
-
+    /*ESP_LOGW(TAG, "BATT DBG raw=%d mv_adc=%d scale=%.3f cal=%.3f vbat=%lu",
+             raw,
+             mv_adc,
+             (double)scale,
+             (double)BATT_CAL_FACTOR,
+             (unsigned long)vbat);
+    */
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_batt_mv  = vbat;
     g_batt_pct = batt_mv_to_pct(vbat);
@@ -1851,29 +1872,37 @@ done:
 
 static void batt_poll(void)
 {
+    uint32_t t = now_ms();
+
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
     if(!g_adc_unit) return;
 
-    uint32_t t = now_ms();
     if(t < g_next_batt_ms) return;
     g_next_batt_ms = t + BATT_MEASURE_INTERVAL_MS;
 
-    // --- Heltec: VBAT divider via GPIO37 (ADC_Ctrl) ---
+    batt_force_read_once();
+    return;
+#endif
+
+    if(!g_adc_unit) return;
+
+    if(t < g_next_batt_ms) return;
+    g_next_batt_ms = t + BATT_MEASURE_INTERVAL_MS;
+
 #ifdef BATT_EN_GPIO
 #if BATT_EN_ACTIVE_LOW
     gpio_set_level(BATT_EN_GPIO, 0);          // enable divider
 #else
     gpio_set_level(BATT_EN_GPIO, 1);
 #endif
-    vTaskDelay(pdMS_TO_TICKS(20));             // settle time (3–5ms)
+    vTaskDelay(pdMS_TO_TICKS(20));
 #endif
 
-    // Resolve ADC channel from GPIO (works on ESP32 + ESP32-S3)
     adc_unit_t unit;
     adc_channel_t ch;
     esp_err_t e = adc_oneshot_io_to_channel((gpio_num_t)BATT_ADC_GPIO, &unit, &ch);
     if(e != ESP_OK){
 #ifdef BATT_EN_GPIO
-        // disable divider again if we enabled it
 #if BATT_EN_ACTIVE_LOW
         gpio_set_level(BATT_EN_GPIO, 1);
 #else
@@ -1883,7 +1912,6 @@ static void batt_poll(void)
         return;
     }
 
-    // Optional: throw away first read for stability
     int raw_dummy = 0;
     (void)adc_oneshot_read(g_adc_unit, ch, &raw_dummy);
 
@@ -1900,7 +1928,6 @@ static void batt_poll(void)
     }
 
 #ifdef BATT_EN_GPIO
-    // disable divider to save battery
 #if BATT_EN_ACTIVE_LOW
     gpio_set_level(BATT_EN_GPIO, 1);
 #else
@@ -1911,30 +1938,25 @@ static void batt_poll(void)
     int mv_adc = 0;
     if(g_adc_cali_ok && g_adc_cali){
         if(adc_cali_raw_to_voltage(g_adc_cali, raw, &mv_adc) != ESP_OK){
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+            mv_adc = (raw * 3300) / 4095;
+#else
             mv_adc = 0;
+#endif
         }
     }else{
-    // rough fallback (calibration recommended)
-    mv_adc = (raw * 3300) / 4095;
+        mv_adc = (raw * 3300) / 4095;
     }
 
     float scale = (BATT_DIV_RTOP_OHMS + BATT_DIV_RBOT_OHMS) / BATT_DIV_RBOT_OHMS;
     uint32_t vbat = (uint32_t)((float)mv_adc * scale * BATT_CAL_FACTOR);
 
-    /*ESP_LOGW(TAG, "BATT DBG poll raw=%d mv_adc=%d scale=%.3f cal=%.3f vbat=%lu",
-         raw,
-         mv_adc,
-         (double)scale,
-         (double)BATT_CAL_FACTOR,
-         (unsigned long)vbat);
-    */
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_batt_mv  = vbat;
     g_batt_pct = batt_mv_to_pct(vbat);
     xSemaphoreGive(g_mutex);
 }
-#endif
-#endif
+
 
 
 // ============================================================================
@@ -1957,14 +1979,14 @@ static int pending_alloc_slot_locked(void)
 }
 
 static void pending_add_locked(uint16_t msg_id,
-                               const char expect_from[7],
+                               const char expect_from[8],
                                const uint8_t *frame,
                                uint16_t frame_len)
 {
     int i = pending_alloc_slot_locked();
     pend[i].used=true;
     pend[i].msg_id=msg_id;
-    memcpy(pend[i].expect_from, expect_from, 7);
+    memcpy(pend[i].expect_from, expect_from, 8);
     pend[i].deadline_ms = now_ms() + ACK_TIMEOUT_MS;
     pend[i].retries_left = ACK_RETRY_MAX;
 
@@ -1973,7 +1995,7 @@ static void pending_add_locked(uint16_t msg_id,
     pend[i].frame_len = frame_len;
 }
 
-static bool pending_mark_acked_locked(uint16_t msg_id, const char src[7])
+static bool pending_mark_acked_locked(uint16_t msg_id, const char src[8])
 {
     for(int i=0;i<MAX_PENDING_ACK;i++){
         if(!pend[i].used) continue;
@@ -1998,7 +2020,8 @@ static void wifi_init_once(void)
     if(e != ESP_OK && e != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(e);
 
     esp_netif_create_default_wifi_ap();
-
+    esp_netif_create_default_wifi_sta();
+    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -2021,24 +2044,85 @@ static void wifi_init_once(void)
         ap.ap.password[0] = 0;
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
 
     g_wifi_inited = true;
 }
 
-static void wifi_start_ap(void)
+void wifi_start_ap(void)
 {
     wifi_init_once();
-    ESP_ERROR_CHECK(esp_wifi_start());
+
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN && err != ESP_ERR_INVALID_STATE) {
+        // ESP_LOGW(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    wifi_enable_ap_part();
     ESP_LOGI(TAG,"WiFi AP started: %s (http://192.168.4.1)", MR_WIFI_AP_SSID);
 }
 
-static void wifi_stop_ap(void)
+void wifi_disable_ap_part(void)
 {
-    esp_err_t e=esp_wifi_stop();
-    if(e != ESP_OK && e != ESP_ERR_WIFI_NOT_INIT) ESP_LOGW(TAG,"esp_wifi_stop: %s", esp_err_to_name(e));
-    ESP_LOGI(TAG,"WiFi AP stopped");
+    if (!g_ap_part_enabled) return;
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        // ESP_LOGW(TAG, "wifi_disable_ap_part set_mode(STA) failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    g_ap_part_enabled = false;
+    ESP_LOGI(TAG, "SoftAP really disabled, STA-only mode active");
+}
+
+void wifi_enable_ap_part(void)
+{
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        // ESP_LOGW(TAG, "wifi_enable_ap_part set_mode(APSTA) failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    wifi_config_t ap = {0};
+
+    strncpy((char*)ap.ap.ssid, g_cfg.wifi_ssid, sizeof(ap.ap.ssid)-1);
+    ap.ap.ssid[sizeof(ap.ap.ssid)-1] = 0;
+    ap.ap.ssid_len = strlen((char*)ap.ap.ssid);
+
+    strncpy((char*)ap.ap.password, g_cfg.wifi_pass, sizeof(ap.ap.password)-1);
+    ap.ap.password[sizeof(ap.ap.password)-1] = 0;
+
+    ap.ap.channel = 1;
+    ap.ap.max_connection = 4;
+    ap.ap.ssid_hidden = 0;
+    ap.ap.beacon_interval = 100;
+    ap.ap.authmode = (strlen((char*)ap.ap.password) >= 8) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    if (err != ESP_OK) {
+        // ESP_LOGW(TAG, "wifi_enable_ap_part set_config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    g_ap_part_enabled = true;
+    ESP_LOGI(TAG, "SoftAP enabled: %s (http://192.168.4.1)", (char*)ap.ap.ssid);
+}
+
+void wifi_stop_ap(void)
+{
+    wifi_disable_ap_part();
+    ESP_LOGI(TAG,"WiFi AP hidden");
+}
+
+static bool wifi_sta_cfg_present(void)
+{
+    if(strlen(g_cfg.wifi_sta_ssid) == 0)
+        return false;
+
+    return true;
 }
 
 static void http_stop(void)
@@ -2055,18 +2139,63 @@ static void http_start_if_needed(void); // forward
 
 void set_wifi_enabled(bool en)
 {
-    if(en == g_wifi_enabled) return;
-    g_wifi_enabled=en;
+    g_wifi_enabled = en;
 
-    if(en){
+    if (en) {
+        /*
+         * Grundregel:
+         * - AP immer zuerst einschalten, damit das Webinterface erreichbar ist
+         * - wenn STA-Credentials vorhanden sind, STA zusätzlich starten
+         * - sobald STA oben ist, darf das STA-Modul den AP ausblenden
+         *   (hide_ap_when_sta_up = true)
+         * - fällt STA später aus, soll das STA-Modul den AP wieder aktivieren
+         */
         wifi_start_ap();
         http_start_if_needed();
-    }else{
+
+#if MR_WIFI_STA_ENABLE
+        if (wifi_sta_cfg_present()) {
+            mr_wifi_sta_cfg_t sta_cfg = {0};
+
+            strncpy(sta_cfg.ssid, g_cfg.wifi_sta_ssid, sizeof(sta_cfg.ssid) - 1);
+            sta_cfg.ssid[sizeof(sta_cfg.ssid) - 1] = 0;
+
+            strncpy(sta_cfg.pass, g_cfg.wifi_sta_pass, sizeof(sta_cfg.pass) - 1);
+            sta_cfg.pass[sizeof(sta_cfg.pass) - 1] = 0;
+
+            sta_cfg.use_dhcp_hostname = true;
+            sta_cfg.retry_max = MR_WIFI_STA_RETRY_MAX;
+            sta_cfg.retry_backoff_ms = 2000;
+
+            /*
+             * Entscheidend für das gewünschte Verhalten:
+             * - STA oben => AP aus
+             * - STA weg  => AP wieder an
+             *
+             * Das muss das STA-Modul anhand dieses Flags steuern.
+             */
+            sta_cfg.hide_ap_when_sta_up = true;
+
+            ESP_LOGI(TAG, "STA SSID from g_cfg: '%s'", g_cfg.wifi_sta_ssid);
+            ESP_LOGI(TAG, "STA PASS LEN from g_cfg: %u",
+                     (unsigned)strlen(g_cfg.wifi_sta_pass));
+
+            esp_err_t err = mr_wifi_sta_reconfigure(&sta_cfg);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "STA reconfigure failed: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGI(TAG, "No STA credentials configured -> AP only");
+        }
+#endif
+    } else {
+#if MR_WIFI_STA_ENABLE
+        mr_wifi_sta_stop();
+#endif
         http_stop();
-        wifi_stop_ap();
+        wifi_disable_ap_part();
     }
 }
-
 
 // ============================================================================
 // =============================== HTTP helpers ===============================
@@ -2077,10 +2206,37 @@ static esp_err_t http_send_text(httpd_req_t *req, const char *txt);
 static bool http_read_body(httpd_req_t *req, char *buf, size_t buf_sz);
 static bool form_get(char *body,const char *key,char *out,size_t out_sz);
 
+
+
+const char *wifi_get_current_url(void)
+{
+    static char url[64];
+
+    esp_netif_ip_info_t ip;
+
+    // zuerst versuchen STA-IP zu holen
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0) {
+        snprintf(url, sizeof(url), "http://" IPSTR, IP2STR(&ip.ip));
+        return url;
+    }
+
+    // sonst AP-IP
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    if (ap && esp_netif_get_ip_info(ap, &ip) == ESP_OK) {
+        snprintf(url, sizeof(url), "http://" IPSTR, IP2STR(&ip.ip));
+        return url;
+    }
+
+    return "http://192.168.4.1";
+}
+
 static void delayed_factory_reset_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(800));
-    ESP_LOGW(TAG, "Factory reset requested -> erasing NVS and restarting");
+    // ESP_LOGW(TAG, "Factory reset requested -> erasing NVS and restarting");
 
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -2114,7 +2270,7 @@ static esp_err_t api_cfg_erase_post(httpd_req_t *req)
 static void delayed_reset_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(800));
-    ESP_LOGW(TAG, "HTTP reset requested -> restarting now");
+    // ESP_LOGW(TAG, "HTTP reset requested -> restarting now");
     esp_restart();
     vTaskDelete(NULL);
 }
@@ -2153,13 +2309,12 @@ static esp_err_t api_cfg_defaults_post(httpd_req_t *req)
 
 static esp_err_t api_cfg_apply_post(httpd_req_t *req)
 {
-    (void)req;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     mr_cfg_apply(&g_cfg);
     xSemaphoreGive(g_mutex);
-    return http_send_text(req, "OK applied");
-}
 
+    return http_send_text(req, "OK applying");
+}
 static esp_err_t api_cfg_get(httpd_req_t *req)
 {
     static char out[768];
@@ -2177,16 +2332,18 @@ static esp_err_t api_cfg_post(httpd_req_t *req)
     char body[512];
     if(!http_read_body(req, body, sizeof(body))) return http_send_text(req, "ERR body");
 
-    // erwartet: key=<k>&val=<v>  (ein Paar pro Request; robust & simpel)
     char k[48]={0}, v[160]={0};
     if(!form_get(body,"key",k,sizeof(k))) return http_send_text(req,"ERR missing key");
     if(!form_get(body,"val",v,sizeof(v))) return http_send_text(req,"ERR missing val");
 
+    ESP_LOGI(TAG, "WEB CFG POST key='%s' val_len=%u", k, (unsigned)strlen(v));
+
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     bool ok = mr_cfg_set_kv(&g_cfg, k, v);
-    if(ok){
-        mr_cfg_apply(&g_cfg);
-    }
+    ESP_LOGI(TAG, "WEB CFG POST result=%d sta_ssid='%s' sta_pass_len=%u",
+             ok ? 1 : 0,
+             g_cfg.wifi_sta_ssid,
+             (unsigned)strlen(g_cfg.wifi_sta_pass));
     xSemaphoreGive(g_mutex);
 
     return http_send_text(req, ok ? "OK" : "ERR invalid");
@@ -2198,6 +2355,11 @@ static esp_err_t api_cfg_save_post(httpd_req_t *req)
     (void)req;
     bool ok=false;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
+
+    ESP_LOGI(TAG, "SAVE sta_ssid='%s' sta_pass_len=%u",
+             g_cfg.wifi_sta_ssid,
+             (unsigned)strlen(g_cfg.wifi_sta_pass));
+
     ok = mr_cfg_save_nvs(&g_cfg);
     xSemaphoreGive(g_mutex);
     return http_send_text(req, ok ? "OK saved" : "ERR save");
@@ -2310,11 +2472,20 @@ static const char *INDEX_HTML =
 ".cfg-actions-row{display:flex;flex-wrap:wrap;gap:10px}"
 ".cfg-actions button{margin:0}"
 ".cfg-actions-row button{min-width:140px}"
+".cfg-three-wide{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:10px}"
+"@media(max-width:980px){.cfg-three-wide{grid-template-columns:1fr 1fr}}"
+"@media(max-width:760px){.cfg-three-wide{grid-template-columns:1fr}}"
+".pw-wrap{position:relative}"
+".pw-wrap input{padding-right:44px}"
+".pw-eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:1px solid #ccc;background:#fff;border-radius:6px;padding:4px 8px;font-size:16px;line-height:1;cursor:pointer;margin:0}"
+".pw-eye:hover{background:#f5f5f5}"
+".cfg-three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}"
+"@media(max-width:980px){.cfg-three{grid-template-columns:1fr 1fr}}"
+"@media(max-width:760px){.cfg-three{grid-template-columns:1fr}}"
 "</style></head><body>"
 
 "<h2>MeshRadio Bonus (c) 2026 Nerd-Verlag https://nerdverlag.com – Roles, Security, Relay, WiFi, Dashboard</h2>"
-"<p class='muted'>AP: <code>" MR_WIFI_AP_SSID "</code> • URL: <code>http://192.168.4.1</code></p>"
-
+"<p class='muted'>AP: <code>" MR_WIFI_AP_SSID "</code> • URL: <code>__MR_URL__</code></p>"
 "<div class='card'>"
 "<div><b><span id='amp' class='amp'></span>UI-Ampel:</b> <span id='ampTxt'>loading…</span> <span class='pill' id='agePill'>?</span></div>"
 "<div><b>Status:</b> <span id='st'>loading…</span></div>"
@@ -2326,7 +2497,7 @@ static const char *INDEX_HTML =
 "<div class='grid'>"
 " <div class='card'>"
 "  <h3>DATA senden</h3>"
-"  <label>Ziel (dst)</label><input id='dst' value='DJ1ABCF'>"
+"  <label>Ziel (dst)</label><input id='dst'>"
 "  <label>ACK (0/1)</label><input id='ack' value='1'>"
 "  <label>Text</label><input id='msg' value='CMD:STATUS?'>"
 "  <button onclick='send()'>SEND</button>"
@@ -2391,15 +2562,18 @@ static const char *INDEX_HTML =
 "    </div>"
 
 "    <div>"
-"      <label>WiFi SSID</label><input id='cfg_ssid'>"
-"      <label>WiFi Password</label><input id='cfg_pass'>"
+"      <label>WiFi AP SSID</label><input id='cfg_ssid'>"
+"      <label>WiFi AP Password</label>"
+"      <div class='pw-wrap'><input id='cfg_pass' type='password'><button type='button' class='pw-eye' onclick='togglePwBtn(\"cfg_pass\", this)'>👁</button></div>""      <label>Router STA SSID</label><input id='cfg_sta_ssid'>"
+"      <label>Router STA Password</label>"
+"      <div class='pw-wrap'><input id='cfg_sta_pass' type='password'><button type='button' class='pw-eye' onclick='togglePwBtn(\"cfg_sta_pass\", this)'>👁</button></div>"
 "      <label>Net ID</label><input id='cfg_net_id'>"
 "      <label>Net Key (32 hex)</label><input id='cfg_netkey'>"
-"      <label>RouteAdv TopN</label><input id='cfg_routeadv_topn'>"
-"      <label>Relay GPIO</label><input id='cfg_relay_gpio'>"
-"      <label>RouteAdv Delta</label><input id='cfg_routeadv_delta'>"
-"      <label>Sensor Wake (ms)</label><input id='cfg_sensor_wake_ms'>"
-"      <label>Sensor RX Window (ms)</label><input id='cfg_sensor_rxwin_ms'>"
+"      <div class='cfg-three'>"
+"        <div><label>RouteAdv TopN</label><input id='cfg_routeadv_topn'></div>"
+"        <div><label>Relay GPIO</label><input id='cfg_relay_gpio'></div>"
+"        <div></div>"
+"      </div>"
 "    </div>"
 
 "    <div>"
@@ -2432,6 +2606,11 @@ static const char *INDEX_HTML =
 "      <div id='cfgmsg' class='muted' style='margin-top:10px'></div>"
 "    </div>"
 "  </div>"
+"  <div class='cfg-three-wide'>"
+"    <div><label>RouteAdv Delta</label><input id='cfg_routeadv_delta'></div>"
+"    <div><label>Sensor Wake (ms)</label><input id='cfg_sensor_wake_ms'></div>"
+"    <div><label>Sensor RX Window (ms)</label><input id='cfg_sensor_rxwin_ms'></div>"
+"  </div>"
 "</div>"
 
 "<script>"
@@ -2442,6 +2621,14 @@ static const char *INDEX_HTML =
 
 "function esc(s){"
 "  return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');"
+"}"
+
+"function togglePwBtn(inputId, btn){"
+"  let inp=document.getElementById(inputId);"
+"  if(!inp) return;"
+"  let show = (inp.type === 'password');"
+"  inp.type = show ? 'text' : 'password';"
+"  if(btn) btn.textContent = show ? '🙈' : '👁';"
 "}"
 
 "function setAmp(color,txt,age){"
@@ -2464,6 +2651,7 @@ static const char *INDEX_HTML =
 "  let dst=document.getElementById('dst').value;"
 "  let msg=document.getElementById('msg').value;"
 "  let ack=document.getElementById('ack').value;"
+"  localStorage.setItem('mr_last_dst', dst);"
 "  let t=await post('/api/send','dst='+encodeURIComponent(dst)+'&msg='+encodeURIComponent(msg)+'&ack='+encodeURIComponent(ack));"
 "  document.getElementById('m').textContent=t;"
 "  refreshAll();"
@@ -2520,7 +2708,11 @@ static const char *INDEX_HTML =
 "    document.getElementById('cfg_beacon_ms').value=c.beacon_ms;"
 "    document.getElementById('cfg_holddown_ms').value=c.holddown_ms;"
 "    document.getElementById('cfg_ssid').value=c.ssid||'';"
+"    document.getElementById('cfg_sta_ssid').value=c.sta_ssid || '';"
 "    document.getElementById('cfg_pass').value='';"
+"    document.getElementById('cfg_sta_pass').value='';"
+"    document.getElementById('cfg_pass').type='password';"
+"    document.getElementById('cfg_sta_pass').type='password';"
 "    document.getElementById('cfg_net_id').value=c.net_id;"
 "    document.getElementById('cfg_netkey').value='';"
 "    document.getElementById('cfg_relay_gpio').value=c.relay_gpio;"
@@ -2552,6 +2744,7 @@ static const char *INDEX_HTML =
 "      ['beacon_ms', document.getElementById('cfg_beacon_ms').value],"
 "      ['holddown_ms', document.getElementById('cfg_holddown_ms').value],"
 "      ['ssid', document.getElementById('cfg_ssid').value],"
+"      ['sta_ssid', document.getElementById('cfg_sta_ssid').value],"
 "      ['netid', document.getElementById('cfg_net_id').value],"
 "      ['relay_gpio', document.getElementById('cfg_relay_gpio').value],"
 "      ['routeadv_topn', document.getElementById('cfg_routeadv_topn').value],"
@@ -2568,8 +2761,10 @@ static const char *INDEX_HTML =
 "    ];"
 
 "    let pass=document.getElementById('cfg_pass').value;"
+"    let sta_pass=document.getElementById('cfg_sta_pass').value;"
 "    let netkey=document.getElementById('cfg_netkey').value;"
 "    if(pass.length>0) ops.push(['pass', pass]);"
+"    if(sta_pass.length>0) ops.push(['sta_pass', sta_pass]);"
 "    if(netkey.length>0) ops.push(['netkey', netkey]);"
 
 "    for(let kv of ops){"
@@ -2582,6 +2777,11 @@ static const char *INDEX_HTML =
 
 "    let ra=await post('/api/cfg/apply','');"
 "    cfgSetMsg(ra);"
+"    cfgSetMsg(ra + ' - Konfiguration übernommen (Reboot erforderlich für WiFi).');"
+"    document.getElementById('cfg_pass').value='';"
+"    document.getElementById('cfg_sta_pass').value='';"
+"    document.getElementById('cfg_pass').type='password';"
+"    document.getElementById('cfg_sta_pass').type='password';"
 "    await cfgRefresh();"
 "    await refreshAll();"
 "  }catch(e){"
@@ -2665,17 +2865,51 @@ static const char *INDEX_HTML =
 "    setAmp('#dc2626','UI ERROR','—');"
 "  }"
 "}"
+"let lastDst = localStorage.getItem('mr_last_dst');"
+"if(lastDst) document.getElementById('dst').value = lastDst;"
+"else document.getElementById('dst').value = 'DJ2RF';"
 "cfgRefresh();"
 "refreshAll();"
 "setInterval(refreshAll, 3000);"
 "</script></body></html>";
 
-static esp_err_t index_get(httpd_req_t *req)
+/*static esp_err_t index_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req,"text/html");
     return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
+*/
+static esp_err_t index_get(httpd_req_t *req)
+{
+    static char html[24576];
+    const char *needle = "__MR_URL__";
+    const char *url = wifi_get_current_url();
 
+    char *pos;
+    size_t prefix_len, suffix_len;
+
+    httpd_resp_set_type(req, "text/html");
+
+    pos = strstr(INDEX_HTML, needle);
+    if (!pos) {
+        return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    }
+
+    prefix_len = (size_t)(pos - INDEX_HTML);
+    suffix_len = strlen(pos + strlen(needle));
+
+    if (prefix_len + strlen(url) + suffix_len + 1 > sizeof(html)) {
+        return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    }
+
+    memcpy(html, INDEX_HTML, prefix_len);
+    memcpy(html + prefix_len, url, strlen(url));
+    memcpy(html + prefix_len + strlen(url),
+           pos + strlen(needle),
+           suffix_len + 1);
+
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
 
 // ============================================================================
 // ============================ API: /api/status ==============================
@@ -2683,12 +2917,18 @@ static esp_err_t index_get(httpd_req_t *req)
 static esp_err_t api_status_get(httpd_req_t *req)
 {
     static char out[3072];
-    size_t off=0;
+    size_t off = 0;
 
+#if MR_BATT_ENABLE
+    batt_poll();
+#endif
+
+    char counters[512];
+    char secstats[256];
+    uint32_t batt_mv = 0, batt_pct = 0;
+    
     xSemaphoreTake(g_mutex, portMAX_DELAY);
 
-    // counters text
-    char counters[512];
     snprintf(counters, sizeof(counters),
         "NODE_MODE: %s (%d)\n"
         "TX: beacon=%" PRIu32 " adv=%" PRIu32 " ack=%" PRIu32 " data=%" PRIu32 "\n"
@@ -2703,25 +2943,26 @@ static esp_err_t api_status_get(httpd_req_t *req)
         g_http_running ? "ON" : "OFF"
     );
 
-    // security text
-    char secstats[256];
     snprintf(secstats, sizeof(secstats),
         "crypto_enable=%u\n"
         "decrypt_ok=%" PRIu32 "\n"
         "decrypt_fail=%" PRIu32 "\n"
         "mac_fail=%" PRIu32 "\n"
         "replay_drop=%" PRIu32 "\n",
-        g_crypto_enable?1:0,
+        g_crypto_enable ? 1 : 0,
         sec_decrypt_ok, sec_decrypt_fail, sec_mac_fail, sec_replay_drop
     );
 
-    uint32_t batt_mv=0, batt_pct=0;
 #if MR_BATT_ENABLE
     batt_mv = g_batt_mv;
     batt_pct = g_batt_pct;
 #endif
+
+    xSemaphoreGive(g_mutex);
+
     char batt_str[48];
     snprintf(batt_str, sizeof(batt_str), "%" PRIu32 "mV/%" PRIu32 "%%", batt_mv, batt_pct);
+    //P_LOGI("BATT", "batt_mv=%" PRIu32 " batt_pct=%" PRIu32, batt_mv, batt_pct);
 
     off += snprintf(out+off, sizeof(out)-off,
         "{"
@@ -2736,45 +2977,42 @@ static esp_err_t api_status_get(httpd_req_t *req)
         "\"batt\":\"%s\","
         "\"secstats\":\"",
         g_callsign_rt,
-        g_crypto_enable?1:0,
+        g_crypto_enable ? 1 : 0,
         (int)g_node_mode,
         node_mode_str(g_node_mode),
         cfg_board_str(),
         cfg_lora_chip_str(),
-        g_wifi_enabled?1:0,
+        g_wifi_enabled ? 1 : 0,
 #if MR_RELAY_ENABLE
-        g_relay_on?1:0,
+        g_relay_on ? 1 : 0,
 #else
         0,
 #endif
         batt_str
     );
 
-    for(const char *p=secstats; *p && off < sizeof(out)-8; p++){
-        if(*p=='\n'){ out[off++]='\\'; out[off++]='n'; }
-        else if(*p=='"'){ out[off++]='\\'; out[off++]='"'; }
-        else out[off++]=*p;
+    for (const char *p = secstats; *p && off < sizeof(out)-8; p++) {
+        if (*p == '\n') { out[off++]='\\'; out[off++]='n'; }
+        else if (*p == '"') { out[off++]='\\'; out[off++]='"'; }
+        else out[off++] = *p;
     }
-    out[off++]='\"';
+    out[off++] = '\"';
 
     off += snprintf(out+off, sizeof(out)-off, ",\"counters\":\"");
-    for(const char *p=counters; *p && off < sizeof(out)-8; p++){
-        if(*p=='\n'){ out[off++]='\\'; out[off++]='n'; }
-        else if(*p=='"'){ out[off++]='\\'; out[off++]='"'; }
-        else out[off++]=*p;
+    for (const char *p = counters; *p && off < sizeof(out)-8; p++) {
+        if (*p == '\n') { out[off++]='\\'; out[off++]='n'; }
+        else if (*p == '"') { out[off++]='\\'; out[off++]='"'; }
+        else out[off++] = *p;
     }
-    out[off++]='\"';
-    out[off++]='}';
+    out[off++] = '\"';
+    out[off++] = '}';
 
-    if(off >= sizeof(out)) out[sizeof(out)-1]=0;
-    else out[off]=0;
-
-    xSemaphoreGive(g_mutex);
+    if (off >= sizeof(out)) out[sizeof(out)-1] = 0;
+    else out[off] = 0;
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
-
 
 // ============================================================================
 // ============================ API: /api/lastrx ==============================
@@ -2824,7 +3062,7 @@ static esp_err_t api_neighbors_get(httpd_req_t *req)
     for(int i=0;i<MAX_NEIGHBORS;i++){
         if(!neighbors[i].used) continue;
 
-        char call[8]; call7_to_str(call, neighbors[i].call);
+        char call[9]; call7_to_str(call, neighbors[i].call);
         uint32_t age = t - neighbors[i].t_ms;
         uint16_t etx = etx_compute_x100(neighbors[i].tx_attempts, neighbors[i].ack_ok);
 
@@ -2879,7 +3117,7 @@ static esp_err_t api_routes_get(httpd_req_t *req)
     for(int i=0;i<MAX_ROUTES;i++){
         if(!routes[i].used) continue;
 
-        char d[8], n[8];
+        char d[9], n[9];
         call7_to_str(d, routes[i].dst);
         call7_to_str(n, routes[i].next);
 
@@ -3042,6 +3280,11 @@ static void http_start(void)
 
     ESP_ERROR_CHECK(httpd_start(&g_http, &cfg));
 
+    /* ---------------------------------------------------------
+   OTA Update API registrieren
+   ---------------------------------------------------------*/
+    mr_wifi_ota_register(g_http);
+
     httpd_uri_t u0 = { .uri="/",                .method=HTTP_GET,  .handler=index_get };
     httpd_register_uri_handler(g_http, &u0);
 
@@ -3126,14 +3369,14 @@ static void routeadv_schedule_next(void)
 // ============================================================================
 // ============================= Remote Commands ==============================
 // ============================================================================
-static void app_send_reply_to_sender(const char from7[7], const char *msg)
+static void app_send_reply_to_sender(const char from7[8], const char *msg)
 {
-    char from_str[8];
+    char from_str[9];
     call7_to_str(from_str, from7);
     send_data_to(from_str, msg, true);
 }
 
-static void app_handle_cmd_if_any(const char from7[7], const char *txt)
+static void app_handle_cmd_if_any(const char from7[8], const char *txt)
 {
     if(!txt || !txt[0]) return;
     //if(g_node_mode != NODE_RELAY) return;
@@ -3251,7 +3494,7 @@ static void send_ack(const mr_hdr_v7_t *rx)
 
     call7_set(h.src, g_callsign_rt);
     call7_set(h.last_hop, g_callsign_rt);
-    memcpy(h.final_dst, rx->last_hop, 7);
+    memcpy(h.final_dst, rx->last_hop, 8);
     call7_set(h.next_hop, "*");
     h.payload_len=0;
 
@@ -3269,13 +3512,13 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
     uint8_t buf[sizeof(mr_hdr_v7_t) + MAX_PAYLOAD]={0};
     mr_hdr_v7_t *h=(mr_hdr_v7_t*)buf;
 
-    char dbg_src[8], dbg_dst[8], dbg_last[8], dbg_next[8];
+    char dbg_src[9], dbg_dst[9], dbg_last[9], dbg_next[9];
     call7_to_str(dbg_src, h->src);
     call7_to_str(dbg_dst, h->final_dst);
     call7_to_str(dbg_last, h->last_hop);
     call7_to_str(dbg_next, h->next_hop);
 
-    ESP_LOGW(TAG,
+    /* ESP_LOGW(TAG,
          "RX FRAME flags=0x%02X src=%s dst=%s last=%s next=%s msg_id=%u seq=%u len=%u",
          h->flags,
          dbg_src,
@@ -3285,6 +3528,7 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
          (unsigned)h->msg_id,
          (unsigned)h->seq,
          (unsigned)h->payload_len);
+    */
 
     h->magic[0]='M'; h->magic[1]='R';
     h->version=MR_PROTO_VERSION;
@@ -3295,8 +3539,8 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
     call7_set(h->src, g_callsign_rt);
     call7_set(h->last_hop, g_callsign_rt);
 
-    char dst7[7]; call7_set(dst7, dst_str);
-    memcpy(h->final_dst, dst7, 7);
+    char dst7[8]; call7_set(dst7, dst_str);
+    memcpy(h->final_dst, dst7, 8);
 
     // Für "profi-level stabil": routing kann hier wieder rein (route_lookup_locked).
     call7_set(h->next_hop, "*");
@@ -3309,13 +3553,13 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
     if(crypto){
         h->flags |= MR_FLAG_SEC;
                 
-                 ESP_LOGW(TAG, "TX SEC SET dst=%s flags=0x%02X msg_id=%u seq=%u payload_plain=%u",
+                 /* ESP_LOGW(TAG, "TX SEC SET dst=%s flags=0x%02X msg_id=%u seq=%u payload_plain=%u",
                  dst_str,
                  h->flags,
                  (unsigned)h->msg_id,
                  (unsigned)h->seq,
                  (unsigned)n);
-
+            */  
         h->payload_len = (uint8_t)(n + SEC_TAG_LEN);
 
         uint8_t tag[SEC_TAG_LEN]={0};
@@ -3331,21 +3575,21 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
             return;
         }
         memcpy(pl + n, tag, SEC_TAG_LEN);
-                ESP_LOGW(TAG,
+                /*ESP_LOGW(TAG,
                  "SEC ENCRYPT OK dst=%s msg_id=%u seq=%u tag=%02X%02X%02X%02X",
                  dst_str,
                  (unsigned)h->msg_id,
                  (unsigned)h->seq,
-                 tag[0], tag[1], tag[2], tag[3]);
+                 tag[0], tag[1], tag[2], tag[3]); */
     }else{
         h->payload_len=(uint8_t)n;
         memcpy(pl, txt, n);
-                ESP_LOGW(TAG, "TX PLAIN dst=%s flags=0x%02X msg_id=%u seq=%u payload_plain=%u",
+                /*ESP_LOGW(TAG, "TX PLAIN dst=%s flags=0x%02X msg_id=%u seq=%u payload_plain=%u",
                  dst_str,
                  h->flags,
                  (unsigned)h->msg_id,
                  (unsigned)h->seq,
-                 (unsigned)n);
+                 (unsigned)n); */
     }
 
     uint16_t frame_len = (uint16_t)(sizeof(mr_hdr_v7_t) + h->payload_len);
@@ -3353,14 +3597,14 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
         if(bucket_take(&b_data)){
         c_tx_data++;
 
-        ESP_LOGW(TAG,
+        /*ESP_LOGW(TAG,
                  "TX AIR dst=%s flags=0x%02X msg_id=%u seq=%u frame_len=%u",
                  dst_str,
                  h->flags,
                  (unsigned)h->msg_id,
                  (unsigned)h->seq,
                  (unsigned)frame_len);
-
+            */
         if (ackreq) {
             xSemaphoreTake(g_mutex, portMAX_DELAY);
             pending_add_locked(h->msg_id, h->final_dst, (const uint8_t*)buf, frame_len);
@@ -3370,12 +3614,12 @@ static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
 
         lora_send_frame(buf, frame_len);
 
-        ESP_LOGW(TAG,
+        /*ESP_LOGW(TAG,
                  "TX AIR DONE dst=%s msg_id=%u seq=%u",
                  dst_str,
                  (unsigned)h->msg_id,
                  (unsigned)h->seq);
-
+            */
     }else{
         c_defer_data++;
         ESP_LOGE(TAG,
@@ -3403,13 +3647,13 @@ static void handle_rx(void)
     mr_hdr_v7_t *h=(mr_hdr_v7_t*)buf;
     if(h->magic[0]!='M'||h->magic[1]!='R') return;
     if(h->version!=MR_PROTO_VERSION) return;
-    char dbg_src[8], dbg_dst[8], dbg_last[8], dbg_next[8];
+    char dbg_src[9], dbg_dst[9], dbg_last[9], dbg_next[9];
     call7_to_str(dbg_src, h->src);
     call7_to_str(dbg_dst, h->final_dst);
     call7_to_str(dbg_last, h->last_hop);
     call7_to_str(dbg_next, h->next_hop);
 
-    ESP_LOGW(TAG,
+    /*ESP_LOGW(TAG,
              "RX FRAME flags=0x%02X src=%s dst=%s last=%s next=%s msg_id=%u seq=%u len=%u rssi=%d",
              h->flags,
              dbg_src,
@@ -3419,7 +3663,7 @@ static void handle_rx(void)
              (unsigned)h->msg_id,
              (unsigned)h->seq,
              (unsigned)h->payload_len,
-             rssi);
+             rssi); */
     // ACK: not duplicate filtered
     if(h->flags & MR_FLAG_ACK){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
@@ -3431,7 +3675,7 @@ static void handle_rx(void)
     }
 
     if(seen_before(h->src, h->msg_id)){
-        ESP_LOGE(TAG, "RX DROP seen_before src=%.7s msg_id=%u",
+        ESP_LOGE(TAG, "RX DROP seen_before src=%.8s msg_id=%u",
                  h->src, (unsigned)h->msg_id);
         return;
     }
@@ -3455,21 +3699,21 @@ static void handle_rx(void)
     }
 
         if(h->flags & MR_FLAG_DATA){
-        char my7[7];
-        char my_str[8];
+        char my7[8];
+        char my_str[9];
         call7_set(my7, g_callsign_rt);
         call7_to_str(my_str, my7);
 
-        ESP_LOGW(TAG, "RX DATA check: dst=%.7s my=%s sec=%u",
+        /* ESP_LOGW(TAG, "RX DATA check: dst=%.8s my=%s sec=%u",
                  h->final_dst,
                  my_str,
                  ((h->flags & MR_FLAG_SEC) ? 1 : 0));
-
+            */
         if(call7_eq(h->final_dst, my7)){        char txt[MAX_PAYLOAD+1]={0};
 
             if((h->flags & MR_FLAG_SEC) != 0){
-                char dbg_from[8];
-call7_to_str(dbg_from, h->src);
+                char dbg_from[9];
+                call7_to_str(dbg_from, h->src);
 
 ESP_LOGW(TAG,
          "SEC RX detected from=%s msg_id=%u seq=%u payload_len=%u",
@@ -3488,7 +3732,7 @@ ESP_LOGW(TAG,
                 bool fresh = replay_check_locked(h->src, h->seq);
                 xSemaphoreGive(g_mutex);
                 if(!fresh){
-                     ESP_LOGE(TAG,"SEC FAIL replay src=%.7s seq=%u",
+                     ESP_LOGE(TAG,"SEC FAIL replay src=%.8s seq=%u",
                         h->src,(unsigned)h->seq);
 
                     xSemaphoreTake(g_mutex, portMAX_DELAY);
@@ -3519,13 +3763,13 @@ ESP_LOGW(TAG,
                 return;
                 }
 
-                 ESP_LOGW(TAG,
+                 /*ESP_LOGW(TAG,
                  "SEC RX decrypt OK from=%s msg_id=%u seq=%u plain_len=%u",
                  dbg_from,
                  (unsigned)h->msg_id,
                  (unsigned)h->seq,
                  (unsigned)ciph_len);
-
+                */
                 xSemaphoreTake(g_mutex, portMAX_DELAY);
                 replay_update_locked(h->src, h->seq);
                 sec_decrypt_ok++;
@@ -3545,7 +3789,7 @@ ESP_LOGW(TAG,
                 }
             }
 
-            char from_str[8];
+            char from_str[9];
             call7_to_str(from_str, h->src);
             xSemaphoreTake(g_mutex, portMAX_DELAY);
             strncpy(g_last_rx_from, from_str, sizeof(g_last_rx_from)-1);
@@ -3998,7 +4242,7 @@ static void cli_uart_init_once(void)
 
     esp_err_t e = uart_driver_install(UART_NUM_0, rx_buf, tx_buf, 0, NULL, 0);
     if(e != ESP_OK && e != ESP_ERR_INVALID_STATE){
-        ESP_LOGW(TAG, "uart_driver_install: %s", esp_err_to_name(e));
+        // ESP_LOGW(TAG, "uart_driver_install: %s", esp_err_to_name(e));
     }
     uart_set_rx_timeout(UART_NUM_0, 1);
     inited=true;
@@ -4219,6 +4463,15 @@ void app_main(void)
     board_power_boot_init();
 #endif
 
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+#ifdef BATT_EN_GPIO
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)BATT_EN_GPIO);
+#endif
+#endif
+
+    mr_wifi_ota_confirm_running_image();
+
     // ------------------------------------------------------------------------
     // 2) Mutex / NVS / Token Buckets / Key
     // ------------------------------------------------------------------------
@@ -4270,6 +4523,13 @@ void app_main(void)
 #if MR_BATT_ENABLE
     batt_init();
 #endif
+
+#if MR_BATT_ENABLE
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+    batt_force_read_once();
+#endif
+#endif
+
 
 // ------------------------------------------------------------------------
 // Runtime-Config zuerst anwenden
@@ -4324,6 +4584,27 @@ config_print();
         ESP_LOGI(TAG,"WiFi/HTTP disabled at boot. Use CLI: wifi on");
     }
 
+/*#if MR_WIFI_STA_ENABLE
+
+    mr_wifi_sta_cfg_t sta_cfg = {0};
+
+    if(strlen(g_cfg.wifi_sta_ssid) > 0)
+    {
+        strncpy(sta_cfg.ssid, g_cfg.wifi_sta_ssid, sizeof(sta_cfg.ssid) - 1);
+        strncpy(sta_cfg.pass, g_cfg.wifi_sta_pass, sizeof(sta_cfg.pass) - 1);
+
+        sta_cfg.use_dhcp_hostname = MR_WIFI_STA_DHCP_HOSTNAME;
+
+        ESP_ERROR_CHECK(mr_wifi_sta_start(&sta_cfg));
+    }
+    else
+    {
+        ESP_LOGI("MR34","STA disabled (no SSID configured)");
+    }
+
+#endif
+*/
+
     // ------------------------------------------------------------------------
     // 6) Scheduler starten
     // ------------------------------------------------------------------------
@@ -4342,11 +4623,51 @@ config_print();
     // ------------------------------------------------------------------------
     if(g_node_mode == NODE_SENSOR){
 
-        lora_set_rx_continuous();
-        vTaskDelay(pdMS_TO_TICKS(150));
+    lora_set_rx_continuous();
+    vTaskDelay(pdMS_TO_TICKS(150));
 
-        char wx[160];
-        strcpy(wx, "SENSOR:AWAKE");
+uint32_t batt_mv = 0, batt_pct = 0;
+
+#if MR_BATT_ENABLE
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+    uint32_t batt_wait_start = now_ms();
+
+    while((now_ms() - batt_wait_start) < 4500){
+        g_next_batt_ms = 0;
+        batt_poll();
+
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        batt_mv  = g_batt_mv;
+        batt_pct = g_batt_pct;
+        xSemaphoreGive(g_mutex);
+
+        if(batt_mv > 0){
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if(batt_mv == 0){
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        g_next_batt_ms = 0;
+        batt_poll();
+
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        batt_mv  = g_batt_mv;
+        batt_pct = g_batt_pct;
+        xSemaphoreGive(g_mutex);
+    }
+#else
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    batt_mv  = g_batt_mv;
+    batt_pct = g_batt_pct;
+    xSemaphoreGive(g_mutex);
+#endif
+#endif
+
+    char wx[160];
+    strcpy(wx, "SENSOR:AWAKE");
 
 #if MR_BME280_ENABLE
         if(g_bme280_enable){
@@ -4365,14 +4686,7 @@ config_print();
                 uint32_t rh_int  = rh_x1000 / 1000U;
                 uint32_t rh_frac = (rh_x1000 % 1000U) / 10U;
 
-#if MR_BATT_ENABLE
-                batt_force_read_once();
-                batt_poll();
-                vTaskDelay(pdMS_TO_TICKS(50));
-                batt_poll();
-#endif
-
-                snprintf(wx, sizeof(wx),
+               snprintf(wx, sizeof(wx),
                     "SENSOR:AWAKE WX t=%" PRId32 ".%02" PRId32 "C "
                     "p=%" PRIu32 "hPa "
                     "rh=%" PRIu32 ".%02" PRIu32 "%% "
@@ -4381,8 +4695,8 @@ config_print();
                     t_int, t_frac,
                     p_hpa,
                     rh_int, rh_frac,
-                    g_batt_mv,
-                    g_batt_pct);
+                    batt_mv,
+                    batt_pct);
             }else{
                 snprintf(wx, sizeof(wx), "SENSOR:AWAKE WX ERR");
             }

@@ -9,8 +9,8 @@ extern "C" {
 
 typedef struct {
     // Identity / Mesh
-    char     callsign[8];         // 7 chars + 0
-    char     relay_callsign[8];   // target for sensor awake
+    char     callsign[9];         // 8 chars + 0
+    char     relay_callsign[9];   // target for sensor awake
     uint8_t  net_id;
     uint8_t  net_key[16];
     bool     crypto_enable;
@@ -36,6 +36,10 @@ typedef struct {
     char     wifi_ssid[32];
     char     wifi_pass[64];
 
+    // Router WLAN (STA)
+    char     wifi_sta_ssid[33];
+    char     wifi_sta_pass[65];
+
     // Power save (sensor)
     bool     powersave_enable;
     uint32_t sensor_wake_period_ms;
@@ -49,8 +53,8 @@ typedef struct {
 } mr_cfg_t;
 
 extern mr_cfg_t g_cfg;
-extern char g_callsign_rt[8];
-extern char g_relay_callsign_rt[8];
+extern char g_callsign_rt[9];
+extern char g_relay_callsign_rt[9];
 
 // lifecycle
 void mr_cfg_defaults(mr_cfg_t *c);
