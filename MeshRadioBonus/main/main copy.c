@@ -2709,6 +2709,10 @@ static const char *INDEX_HTML =
 "    document.getElementById('cfg_holddown_ms').value=c.holddown_ms;"
 "    document.getElementById('cfg_ssid').value=c.ssid||'';"
 "    document.getElementById('cfg_sta_ssid').value=c.sta_ssid || '';"
+"    document.getElementById('cfg_pass').value='';"
+"    document.getElementById('cfg_sta_pass').value='';"
+"    document.getElementById('cfg_pass').type='password';"
+"    document.getElementById('cfg_sta_pass').type='password';"
 "    document.getElementById('cfg_net_id').value=c.net_id;"
 "    document.getElementById('cfg_netkey').value='';"
 "    document.getElementById('cfg_relay_gpio').value=c.relay_gpio;"
@@ -2774,21 +2778,20 @@ static const char *INDEX_HTML =
 "    let ra=await post('/api/cfg/apply','');"
 "    cfgSetMsg(ra);"
 "    cfgSetMsg(ra + ' - Konfiguration übernommen (Reboot erforderlich für WiFi).');"
-"    await refreshAll();"
-"  }catch(e){"
-"    cfgSetMsg('Apply error: '+e);"
-"  }"
-"}"
-"async function cfgSave(){"
-"  let r=await post('/api/cfg/save','');"
-"  cfgSetMsg(r);"
-"  if(String(r).startsWith('OK')){"
 "    document.getElementById('cfg_pass').value='';"
 "    document.getElementById('cfg_sta_pass').value='';"
 "    document.getElementById('cfg_pass').type='password';"
 "    document.getElementById('cfg_sta_pass').type='password';"
 "    await cfgRefresh();"
+"    await refreshAll();"
+"  }catch(e){"
+"    cfgSetMsg('Apply error: '+e);"
 "  }"
+"}"
+
+"async function cfgSave(){"
+"  let r=await post('/api/cfg/save','');"
+"  cfgSetMsg(r);"
 "}"
 
 "async function cfgLoad(){"
@@ -2870,6 +2873,12 @@ static const char *INDEX_HTML =
 "setInterval(refreshAll, 3000);"
 "</script></body></html>";
 
+/*static esp_err_t index_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req,"text/html");
+    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+*/
 static esp_err_t index_get(httpd_req_t *req)
 {
     static char html[24576];
