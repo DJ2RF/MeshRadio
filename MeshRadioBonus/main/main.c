@@ -42,6 +42,14 @@
 #include "incl/mr_sec_ccm.h"
 #include "incl/mr_wifi_sta.h"
 #include "incl/mr_wifi_ota.h"
+#include "incl/mr_display.h"
+#include "incl/mr_time_net.h"
+#include "incl/mr_board.h"
+#include "incl/mr_gps.h"
+#include "incl/mr_pmu.h"
+#include "incl/aprs.h"
+#include "incl/aprs_web.h"
+#include "incl/bme280.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -114,6 +122,8 @@
 
 // LoRa TX timeout (für beide Chips)
 #define LORA_TX_TIMEOUT_MS 2000
+#define GPS_SEND_INTERVAL_MS 60000
+#define GPS_TEXT_MAX_LEN     96
 
 
 // ============================================================================
@@ -205,23 +215,6 @@ char g_relay_callsign_rt[9] = MR_RELAY_CALLSIGN;
 uint32_t g_rf_freq_hz_runtime = DEFAULT_RF_FREQ_HZ;
 int8_t   g_tx_power_dbm_runtime = 2;
 
-#if MR_BME280_ENABLE
-static i2c_master_bus_handle_t g_i2c_bus = NULL;
-static i2c_master_dev_handle_t g_bme_dev = NULL;
-
-typedef struct {
-    uint16_t dig_T1; int16_t dig_T2, dig_T3;
-    uint16_t dig_P1; int16_t dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
-    uint8_t  dig_H1, dig_H3;
-    int16_t  dig_H2, dig_H4, dig_H5;
-    int8_t   dig_H6;
-    int32_t  t_fine;
-    bool     ok;
-} bme280_t;
-
-static bme280_t g_bme = {0};
-#endif
-
 // ---------------- RTC persistente Zähler (über DeepSleep hinweg) ----------------
 // Bleiben bei DeepSleep erhalten. Bei Power-Off sind sie weg (dann wird neu gesät).
 RTC_DATA_ATTR static uint16_t rtc_msg_id = 0;
@@ -279,7 +272,7 @@ static uint32_t c_drop_routeadv=0, c_drop_data=0;
 
 static bucket_t b_beacon, b_routeadv, b_ack, b_data;
 
-static bool g_wifi_enabled = (MR_WIFI_RUNTIME_DEFAULT ? true : false);
+bool g_wifi_enabled = (MR_WIFI_RUNTIME_DEFAULT ? true : false);
 static bool g_wifi_inited  = false;
 static bool g_ap_part_enabled = false;
 
@@ -290,6 +283,14 @@ static uint32_t g_last_rx_ms    = 0;
 #if MR_RELAY_ENABLE
 static bool g_relay_on=false;
 #endif
+
+//void lora_log_chip_info(void);
+//void lora_init_radio(void);
+void lora_set_rx_continuous(void);
+void lora_recover_radio(void);
+//void lora_send_frame(const uint8_t *d, size_t len);
+//bool lora_try_read_frame(uint8_t *buf, size_t maxlen, uint8_t *out_len, int *out_rssi);
+static void send_data_to(const char *dst_str, const char *txt, bool ackreq);
 
 // ADC
 #if MR_BATT_ENABLE
@@ -334,6 +335,10 @@ static const char *cfg_board_str(void)
     return "HELTEC_V3";
 #elif (MR_BOARD_PRESET == MR_BOARD_LILYGO_SX1276)
     return "LILYGO_SX1276";
+#elif (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276)
+    return "TBEAM_V11_SX1276";
+#elif (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+    return "TBEAM_V12_AXP2101";
 #else
     return "UNKNOWN";
 #endif
@@ -519,213 +524,6 @@ static inline void batt_path_enable(bool en)
 }
 
 #endif
-
-#if MR_BME280_ENABLE
-
-static int16_t sign_extend_12(uint16_t v)
-{
-    // v hat Bits 11..0, Bit 11 ist das Vorzeichen
-    if (v & 0x0800) v |= 0xF000;
-    return (int16_t)v;
-}
-
-
-static void i2c_init_once(void)
-{
-    if(g_i2c_bus) return;
-
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = PIN_I2C_SDA,
-        .scl_io_num = PIN_I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &g_i2c_bus));
-
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = BME280_I2C_ADDR,
-        .scl_speed_hz = BME280_I2C_CLK_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_bme_dev));
-
-    ESP_LOGI(TAG, "I2C init: SDA=%d SCL=%d addr=0x%02X",
-             PIN_I2C_SDA, PIN_I2C_SCL, BME280_I2C_ADDR);
-}
-
-static esp_err_t bme_read(uint8_t reg, uint8_t *out, size_t n)
-{
-    return i2c_master_transmit_receive(g_bme_dev, &reg, 1, out, n, 100);
-}
-static esp_err_t bme_write(uint8_t reg, uint8_t val)
-{
-    uint8_t tx[2] = { reg, val };
-    return i2c_master_transmit(g_bme_dev, tx, sizeof(tx), 100);
-}
-
-#define BME280_REG_ID        0xD0
-#define BME280_REG_RESET     0xE0
-#define BME280_REG_CTRL_HUM  0xF2
-#define BME280_REG_STATUS    0xF3
-#define BME280_REG_CTRL_MEAS 0xF4
-#define BME280_REG_CONFIG    0xF5
-#define BME280_REG_PRESS_MSB 0xF7
-
-static int32_t bme_comp_T_x100(int32_t adc_T, bme280_t *b)
-{
-    int32_t var1 = ((((adc_T >> 3) - ((int32_t)b->dig_T1 << 1))) * ((int32_t)b->dig_T2)) >> 11;
-    int32_t var2 = (((((adc_T >> 4) - ((int32_t)b->dig_T1)) * ((adc_T >> 4) - ((int32_t)b->dig_T1))) >> 12) *
-                    ((int32_t)b->dig_T3)) >> 14;
-    b->t_fine = var1 + var2;
-    return (b->t_fine * 5 + 128) >> 8; // 0.01°C
-}
-
-static uint32_t bme_comp_P_Pa(int32_t adc_P, bme280_t *b)
-{
-    int64_t var1 = ((int64_t)b->t_fine) - 128000;
-    int64_t var2 = var1 * var1 * (int64_t)b->dig_P6;
-    var2 = var2 + ((var1 * (int64_t)b->dig_P5) << 17);
-    var2 = var2 + (((int64_t)b->dig_P4) << 35);
-    var1 = ((var1 * var1 * (int64_t)b->dig_P3) >> 8) + ((var1 * (int64_t)b->dig_P2) << 12);
-    var1 = (((((int64_t)1) << 47) + var1) * (int64_t)b->dig_P1) >> 33;
-
-    if(var1 == 0) return 0;
-
-    int64_t p = 1048576 - adc_P;
-    p = (((p << 31) - var2) * 3125) / var1;
-    var1 = (((int64_t)b->dig_P9) * (p >> 13) * (p >> 13)) >> 25;
-    var2 = (((int64_t)b->dig_P8) * p) >> 19;
-
-    p = ((p + var1 + var2) >> 8) + (((int64_t)b->dig_P7) << 4);
-    return (uint32_t)(p >> 8); // Pa
-}
-
-static uint32_t bme_comp_H_x1000(int32_t adc_H, bme280_t *b)
-{
-    int32_t v_x1_u32r = (b->t_fine - ((int32_t)76800));
-    v_x1_u32r = (((((adc_H << 14) - (((int32_t)b->dig_H4) << 20) - (((int32_t)b->dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
-                 (((((((v_x1_u32r * ((int32_t)b->dig_H6)) >> 10) * (((v_x1_u32r * ((int32_t)b->dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
-                      ((int32_t)2097152)) * ((int32_t)b->dig_H2) + 8192) >> 14));
-    v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) * ((int32_t)b->dig_H1)) >> 4));
-    if(v_x1_u32r < 0) v_x1_u32r = 0;
-    if(v_x1_u32r > 419430400) v_x1_u32r = 419430400;
-
-    //uint32_t h = (uint32_t)(v_x1_u32r >> 12); // %*256
-
-    if (v_x1_u32r < 0) v_x1_u32r = 0;
-    if (v_x1_u32r > 419430400) v_x1_u32r = 419430400;
-    uint32_t h = (uint32_t)(v_x1_u32r >> 12);   // %*256
-    uint32_t rh_x1000 = h * 1000U / 256U;       // %*1000
-
-    if (rh_x1000 > 100000U) rh_x1000 = 100000U; // 100.000%
-    //return rh_x1000;
-
-    uint32_t h1024 = (uint32_t)(v_x1_u32r >> 12);   // %RH * 1024 (Bosch)
-    return (h1024 * 1000U) / 1024U;                 // %RH * 1000
-
-    //return h * 1000U / 256U; // %*1000
-}
-
-static bool bme280_init(void)
-{
-    i2c_init_once();
-
-    uint8_t id=0;
-    if(bme_read(BME280_REG_ID, &id, 1) != ESP_OK){
-        // ESP_LOGW(TAG, "BME280: read ID failed");
-        return false;
-    }
-    
-    ESP_LOGI(TAG, "BME/BMP ID=0x%02X (BME=0x60, BMP=0x58)", id);
-
-    (void)bme_write(BME280_REG_RESET, 0xB6);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    uint8_t c1[26]={0};
-    uint8_t c2[7]={0};
-    if(bme_read(0x88, c1, sizeof(c1)) != ESP_OK) return false;
-    if(bme_read(0xE1, c2, sizeof(c2)) != ESP_OK) return false;
-
-    bme280_t *b=&g_bme;
-    memset(b,0,sizeof(*b));
-
-    b->dig_T1 = (uint16_t)(c1[1]<<8 | c1[0]);
-    b->dig_T2 = (int16_t)(c1[3]<<8 | c1[2]);
-    b->dig_T3 = (int16_t)(c1[5]<<8 | c1[4]);
-
-    b->dig_P1 = (uint16_t)(c1[7]<<8 | c1[6]);
-    b->dig_P2 = (int16_t)(c1[9]<<8 | c1[8]);
-    b->dig_P3 = (int16_t)(c1[11]<<8 | c1[10]);
-    b->dig_P4 = (int16_t)(c1[13]<<8 | c1[12]);
-    b->dig_P5 = (int16_t)(c1[15]<<8 | c1[14]);
-    b->dig_P6 = (int16_t)(c1[17]<<8 | c1[16]);
-    b->dig_P7 = (int16_t)(c1[19]<<8 | c1[18]);
-    b->dig_P8 = (int16_t)(c1[21]<<8 | c1[20]);
-    b->dig_P9 = (int16_t)(c1[23]<<8 | c1[22]);
-
-    b->dig_H1 = c1[25];
-    b->dig_H2 = (int16_t)(c2[1]<<8 | c2[0]);
-    b->dig_H3 = c2[2];
-    
-    uint16_t h4u = ((uint16_t)c2[3] << 4) | (c2[4] & 0x0F);      // E4:E5[3:0]
-    uint16_t h5u = ((uint16_t)c2[5] << 4) | (c2[4] >> 4);        // E6:E5[7:4]
-    b->dig_H4 = sign_extend_12(h4u);
-    b->dig_H5 = sign_extend_12(h5u);
-
-    b->dig_H6 = (int8_t)c2[6];
-
-    ESP_LOGI(TAG, "BME cal H: H1=%u H2=%d H3=%u H4=%d H5=%d H6=%d",
-         g_bme.dig_H1, g_bme.dig_H2, g_bme.dig_H3,
-         g_bme.dig_H4, g_bme.dig_H5, g_bme.dig_H6);
-
-    // config: filter off, standby min
-    (void)bme_write(BME280_REG_CONFIG, 0x00);
-    // hum osrs x1
-    (void)bme_write(BME280_REG_CTRL_HUM, 0x01);
-    // temp osrs x1, press osrs x1, normal mode
-    (void)bme_write(BME280_REG_CTRL_MEAS, (0x01<<5) | (0x01<<2) | 0x03);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    b->ok=true;
-    ESP_LOGI(TAG, "BME280 init OK (ID=0x%02X)", id);
-    return true;
-}
-
-static bool bme280_read_weather(int32_t *out_t_x100, uint32_t *out_p_pa, uint32_t *out_rh_x1000)
-{
-    if(!g_bme.ok) return false;
-
-    // optional: warten bis NVM Copy fertig
-    uint8_t st=0;
-    for(int i=0;i<10;i++){
-        if(bme_read(BME280_REG_STATUS, &st, 1) != ESP_OK) break;
-        if((st & 0x01) == 0) break; // im_update
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    uint8_t d[8]={0};
-    if(bme_read(BME280_REG_PRESS_MSB, d, sizeof(d)) != ESP_OK) return false;
-
-    int32_t adc_P = (int32_t)((d[0]<<12) | (d[1]<<4) | (d[2]>>4));
-    int32_t adc_T = (int32_t)((d[3]<<12) | (d[4]<<4) | (d[5]>>4));
-    int32_t adc_H = (int32_t)((d[6]<<8)  | (d[7]));
-
-    ESP_LOGI(TAG, "BME raw: adc_T=%ld adc_P=%ld adc_H=%ld",
-         (long)adc_T, (long)adc_P, (long)adc_H);
-
-    int32_t t_x100 = bme_comp_T_x100(adc_T, &g_bme);
-    uint32_t p_pa  = bme_comp_P_Pa(adc_P, &g_bme);
-    uint32_t h_x1000 = bme_comp_H_x1000(adc_H, &g_bme);
-
-    if(out_t_x100) *out_t_x100 = t_x100;
-    if(out_p_pa) *out_p_pa = p_pa;
-    if(out_rh_x1000) *out_rh_x1000 = h_x1000;
-    return true;
-}
-#endif
-
 
 // ============================================================================
 // ================================ SEEN ======================================
@@ -1048,7 +846,7 @@ static uint32_t hz_to_frf(uint32_t f)
     return (uint32_t)frf;
 }
 
-static void lora_init_radio(void)
+void lora_init_radio(void)
 {
     lora_spi_lock();
 
@@ -1094,7 +892,7 @@ void lora_recover_radio(void)
     lora_init_radio();
 }
 
-static void lora_send_frame(const uint8_t *d, size_t len)
+void lora_send_frame(const uint8_t *d, size_t len)
 {
     // optional CAD backoff
     if(g_cad_enable){
@@ -1131,7 +929,7 @@ static void lora_send_frame(const uint8_t *d, size_t len)
     lora_spi_unlock();
 }
 
-static bool lora_try_read_frame(uint8_t *buf, size_t maxlen, uint8_t *out_len, int *out_rssi)
+bool lora_try_read_frame(uint8_t *buf, size_t maxlen, uint8_t *out_len, int *out_rssi)
 {
     uint8_t len=0;
     int rssi=-127;
@@ -1166,7 +964,7 @@ static bool lora_try_read_frame(uint8_t *buf, size_t maxlen, uint8_t *out_len, i
     return true;
 }
 
-static void lora_log_chip_info(void)
+void lora_log_chip_info(void)
 {
     lora_spi_lock();
     uint8_t v = sx1276_rd(SX1276_REG_VERSION);
@@ -1690,6 +1488,16 @@ static void batt_enable_hw(void)
 
 static void batt_init(void)
 {
+    if (mr_board_has_pmu()) {
+        ESP_LOGI(TAG, "Battery via PMU on board %s -> ADC init skipped", mr_board_name());
+        return;
+    }
+
+#if !defined(BATT_ADC_GPIO) || (BATT_ADC_GPIO < 0)
+    ESP_LOGI(TAG, "Battery ADC disabled for board %s", mr_board_name());
+    return;
+#endif
+
     batt_enable_hw();
 
 #ifdef BATT_EN_GPIO
@@ -1741,9 +1549,22 @@ static void batt_init(void)
 #ifndef CONFIG_IDF_TARGET_ESP32S3
 static void batt_init(void)
 {
+    static uint32_t dbg_last_ms = 0;
+    (void)dbg_last_ms;
+
+    if (mr_board_has_pmu()) {
+        ESP_LOGI(TAG, "Battery via PMU on board %s -> ADC init skipped", mr_board_name());
+        return;
+    }
+
+#if !defined(BATT_ADC_GPIO) || (BATT_ADC_GPIO < 0)
+    ESP_LOGI(TAG, "Battery ADC disabled for board %s", mr_board_name());
+    return;
+#endif
+
     int ch = batt_adc_gpio_to_chan((gpio_num_t)BATT_ADC_GPIO);
     if(ch < 0){
-        // ESP_LOGW(TAG,"Battery ADC: GPIO%d not supported in mapping -> disabled", BATT_ADC_GPIO);
+        ESP_LOGW(TAG,"Battery ADC: GPIO%d not supported in mapping -> disabled", BATT_ADC_GPIO);
         return;
     }
 
@@ -1783,10 +1604,10 @@ static void batt_init(void)
         if(adc_cali_create_scheme_line_fitting(&cali_cfg, &g_adc_cali) == ESP_OK){
             g_adc_cali_ok=true;
         }else{
-            // ESP_LOGW(TAG,"ADC cali (line fitting) failed -> using raw fallback");
+            ESP_LOGW(TAG,"ADC cali (line fitting) failed -> using raw fallback");
         }
 #else
-        // ESP_LOGW(TAG,"ADC calibration not supported in this ESP-IDF build -> using raw fallback");
+        ESP_LOGW(TAG,"ADC calibration not supported in this ESP-IDF build -> using raw fallback");
 #endif
     }
 
@@ -1806,6 +1627,9 @@ static uint32_t batt_mv_to_pct(uint32_t mv)
 #if MR_BATT_ENABLE
 static void batt_force_read_once(void)
 {
+#if !defined(BATT_ADC_GPIO) || (BATT_ADC_GPIO < 0)
+    return;
+#endif
     if(!g_adc_unit) return;
 
 #ifdef BATT_EN_GPIO
@@ -1872,26 +1696,79 @@ done:
 
 static void batt_poll(void)
 {
+#if MR_BATT_ENABLE
+    const mr_board_info_t *b = mr_board_get();
+    if (!b) {
+        g_batt_mv = 0;
+        g_batt_pct = 0;
+        return;
+    }
+
     uint32_t t = now_ms();
-
-#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
-    if(!g_adc_unit) return;
-
-    if(t < g_next_batt_ms) return;
+    if (t < g_next_batt_ms) {
+        return;
+    }
     g_next_batt_ms = t + BATT_MEASURE_INTERVAL_MS;
 
+    // =====================================================================
+    // ======================= PMU BOARDS (T-BEAM) ==========================
+    // =====================================================================
+    if (b->has_pmu) {
+        if (!mr_pmu_is_available()) {
+            g_batt_mv = 0;
+            g_batt_pct = 0;
+            return;
+        }
+
+        mr_pmu_status_t st;
+        if (mr_pmu_poll() == ESP_OK && mr_pmu_get_status(&st)) {
+            if (!st.battery_present || st.battery_mv < 1000) {
+    // kein Akku erkannt
+    g_batt_mv  = 0;
+    g_batt_pct = 0;
+
+    //ESP_LOGI("BATT", "kein Akku");
+    } else {
+    g_batt_mv  = st.battery_mv;
+    g_batt_pct = st.battery_percent;
+
+    }
+    } else {
+        g_batt_mv = 0;
+        g_batt_pct = 0;
+    }
+    return;
+}
+
+    // =====================================================================
+    // ========================== ADC DISABLED ==============================
+    // =====================================================================
+#if !defined(BATT_ADC_GPIO) || (BATT_ADC_GPIO < 0)
+    g_batt_mv = 0;
+    g_batt_pct = 0;
+    return;
+#endif
+
+    if (!g_adc_unit) {
+        g_batt_mv = 0;
+        g_batt_pct = 0;
+        return;
+    }
+
+    // =====================================================================
+    // ======================= HELTEC SPECIAL PATH ==========================
+    // =====================================================================
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
     batt_force_read_once();
     return;
 #endif
 
-    if(!g_adc_unit) return;
-
-    if(t < g_next_batt_ms) return;
-    g_next_batt_ms = t + BATT_MEASURE_INTERVAL_MS;
-
+    // =====================================================================
+    // ======================= ADC BOARDS (LILYGO etc.) =====================
+    // =====================================================================
 #ifdef BATT_EN_GPIO
 #if BATT_EN_ACTIVE_LOW
-    gpio_set_level(BATT_EN_GPIO, 0);          // enable divider
+    gpio_set_level(BATT_EN_GPIO, 0);
 #else
     gpio_set_level(BATT_EN_GPIO, 1);
 #endif
@@ -1901,7 +1778,7 @@ static void batt_poll(void)
     adc_unit_t unit;
     adc_channel_t ch;
     esp_err_t e = adc_oneshot_io_to_channel((gpio_num_t)BATT_ADC_GPIO, &unit, &ch);
-    if(e != ESP_OK){
+    if (e != ESP_OK) {
 #ifdef BATT_EN_GPIO
 #if BATT_EN_ACTIVE_LOW
         gpio_set_level(BATT_EN_GPIO, 1);
@@ -1909,6 +1786,8 @@ static void batt_poll(void)
         gpio_set_level(BATT_EN_GPIO, 0);
 #endif
 #endif
+        g_batt_mv = 0;
+        g_batt_pct = 0;
         return;
     }
 
@@ -1916,7 +1795,7 @@ static void batt_poll(void)
     (void)adc_oneshot_read(g_adc_unit, ch, &raw_dummy);
 
     int raw = 0;
-    if(adc_oneshot_read(g_adc_unit, ch, &raw) != ESP_OK){
+    if (adc_oneshot_read(g_adc_unit, ch, &raw) != ESP_OK) {
 #ifdef BATT_EN_GPIO
 #if BATT_EN_ACTIVE_LOW
         gpio_set_level(BATT_EN_GPIO, 1);
@@ -1924,6 +1803,8 @@ static void batt_poll(void)
         gpio_set_level(BATT_EN_GPIO, 0);
 #endif
 #endif
+        g_batt_mv = 0;
+        g_batt_pct = 0;
         return;
     }
 
@@ -1936,28 +1817,37 @@ static void batt_poll(void)
 #endif
 
     int mv_adc = 0;
-    if(g_adc_cali_ok && g_adc_cali){
-        if(adc_cali_raw_to_voltage(g_adc_cali, raw, &mv_adc) != ESP_OK){
-#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
-            mv_adc = (raw * 3300) / 4095;
-#else
+    if (g_adc_cali_ok && g_adc_cali) {
+        if (adc_cali_raw_to_voltage(g_adc_cali, raw, &mv_adc) != ESP_OK) {
             mv_adc = 0;
-#endif
         }
-    }else{
+    } else {
         mv_adc = (raw * 3300) / 4095;
     }
 
     float scale = (BATT_DIV_RTOP_OHMS + BATT_DIV_RBOT_OHMS) / BATT_DIV_RBOT_OHMS;
     uint32_t vbat = (uint32_t)((float)mv_adc * scale * BATT_CAL_FACTOR);
 
-    xSemaphoreTake(g_mutex, portMAX_DELAY);
-    g_batt_mv  = vbat;
-    g_batt_pct = batt_mv_to_pct(vbat);
-    xSemaphoreGive(g_mutex);
+    g_batt_mv = vbat;
+
+    if (g_batt_mv <= BATT_EMPTY_MV) {
+        g_batt_pct = 0;
+    } else if (g_batt_mv >= BATT_FULL_MV) {
+        g_batt_pct = 100;
+    } else {
+        g_batt_pct = (uint32_t)(
+            (g_batt_mv - BATT_EMPTY_MV) * 100U /
+            (BATT_FULL_MV - BATT_EMPTY_MV)
+        );
+    }
+
+    ESP_LOGI("BATT", "ADC: raw=%d mv_adc=%d vbat=%lu => %lu%%",
+             raw,
+             mv_adc,
+             (unsigned long)g_batt_mv,
+             (unsigned long)g_batt_pct);
+#endif
 }
-
-
 
 // ============================================================================
 // =============================== Pending ACK ================================
@@ -2206,6 +2096,135 @@ static esp_err_t http_send_text(httpd_req_t *req, const char *txt);
 static bool http_read_body(httpd_req_t *req, char *buf, size_t buf_sz);
 static bool form_get(char *body,const char *key,char *out,size_t out_sz);
 
+static void aprs_cfg_from_local_web(aprs_cfg_t *out)
+{
+    if(!out) return;
+    memset(out, 0, sizeof(*out));
+    out->enabled = aprs_web_enabled();
+    snprintf(out->callsign, sizeof(out->callsign), "%s", aprs_web_callsign());
+    snprintf(out->passcode, sizeof(out->passcode), "%s", aprs_web_passcode());
+    out->symbol_table = aprs_web_symbol_table();
+    out->symbol_code  = aprs_web_symbol_code();
+    snprintf(out->comment, sizeof(out->comment), "%s", aprs_web_comment());
+    snprintf(out->host, sizeof(out->host), "%s", aprs_web_host());
+    out->port = aprs_web_port();
+}
+
+static void aprs_format_lat_for_body(double lat, char *out, size_t out_sz, char *out_hemi)
+{
+    double alat = (lat < 0.0) ? -lat : lat;
+    int deg = (int)alat;
+    double min = (alat - (double)deg) * 60.0;
+    snprintf(out, out_sz, "%02d%05.2f", deg, min);
+    *out_hemi = (lat >= 0.0) ? 'N' : 'S';
+}
+
+static void aprs_format_lon_for_body(double lon, char *out, size_t out_sz, char *out_hemi)
+{
+    double alon = (lon < 0.0) ? -lon : lon;
+    int deg = (int)alon;
+    double min = (alon - (double)deg) * 60.0;
+    snprintf(out, out_sz, "%03d%05.2f", deg, min);
+    *out_hemi = (lon >= 0.0) ? 'E' : 'W';
+}
+
+static bool aprs_build_body_from_gps_text(const char *gps_txt,
+                                          const aprs_cfg_t *cfg,
+                                          char *out_body,
+                                          size_t out_body_sz)
+{
+    if(!gps_txt || !cfg || !out_body || out_body_sz < 32) return false;
+
+    double lat = 0.0;
+    double lon = 0.0;
+    if(sscanf(gps_txt, "GPS %lf %lf", &lat, &lon) != 2){
+        return false;
+    }
+
+    if(lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0){
+        return false;
+    }
+
+    char aprs_lat[16];
+    char aprs_lon[16];
+    char lat_hemi = 'N';
+    char lon_hemi = 'E';
+
+    aprs_format_lat_for_body(lat, aprs_lat, sizeof(aprs_lat), &lat_hemi);
+    aprs_format_lon_for_body(lon, aprs_lon, sizeof(aprs_lon), &lon_hemi);
+
+    char symbol_table = cfg->symbol_table ? cfg->symbol_table : '/';
+    char symbol_code  = cfg->symbol_code  ? cfg->symbol_code  : '>';
+
+    int n = snprintf(out_body, out_body_sz,
+                     "!%.7s%c%c%.8s%c%c%s",
+                     aprs_lat, lat_hemi,
+                     symbol_table,
+                     aprs_lon, lon_hemi,
+                     symbol_code,
+                     cfg->comment);
+    return (n > 0 && (size_t)n < out_body_sz);
+}
+
+static bool aprs_build_direct_msg(const aprs_cfg_t *cfg,
+                                  const char *body,
+                                  char *out_msg,
+                                  size_t out_msg_sz)
+{
+    if(!cfg || !body || !out_msg || out_msg_sz < 32) return false;
+    if(!cfg->enabled) return false;
+    if(cfg->callsign[0] == 0 || cfg->passcode[0] == 0 || cfg->host[0] == 0 || cfg->port == 0) return false;
+
+    int n = snprintf(out_msg, out_msg_sz,
+                     "APRSD C=%s P=%s H=%s O=%u B=%s",
+                     cfg->callsign,
+                     cfg->passcode,
+                     cfg->host,
+                     (unsigned)cfg->port,
+                     body);
+    return (n > 0 && (size_t)n < out_msg_sz);
+}
+
+static bool aprs_direct_parse_msg(const char *msg,
+                                  aprs_cfg_t *out,
+                                  char *body,
+                                  size_t body_sz)
+{
+    if(!msg || !out || !body || body_sz < 8) return false;
+    if(strncmp(msg, "APRSD ", 6) != 0) return false;
+
+    const char *body_tag = strstr(msg, " B=");
+    if(!body_tag) return false;
+
+    size_t head_len = (size_t)(body_tag - msg);
+    if(head_len >= 192) return false;
+
+    char head[192];
+    memcpy(head, msg, head_len);
+    head[head_len] = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->enabled = true;
+
+    char c[16] = {0};
+    char p[16] = {0};
+    char h[64] = {0};
+    unsigned port = 0;
+
+    int n = sscanf(head,
+                   "APRSD C=%15s P=%15s H=%63s O=%u",
+                   c, p, h, &port);
+    if(n != 4) return false;
+    if(port == 0 || port > 65535) return false;
+
+    snprintf(out->callsign, sizeof(out->callsign), "%s", c);
+    snprintf(out->passcode, sizeof(out->passcode), "%s", p);
+    snprintf(out->host, sizeof(out->host), "%s", h);
+    out->port = (uint16_t)port;
+
+    snprintf(body, body_sz, "%s", body_tag + 3);
+    return body[0] != 0;
+}
 
 
 const char *wifi_get_current_url(void)
@@ -2530,6 +2549,7 @@ static const char *INDEX_HTML =
 "  <button onclick='setRelay(0)'>Relay OFF</button>"
 "  <button onclick='toggleRelay()'>Relay TOGGLE</button>"
 " </div>"
+" __APRS_BUTTON__ "
 "</div>"
 
 "<div class='card'><h3>Last RX</h3><div id='lastrx'>loading…</div></div>"
@@ -2872,32 +2892,47 @@ static const char *INDEX_HTML =
 
 static esp_err_t index_get(httpd_req_t *req)
 {
-    static char html[24576];
-    const char *needle = "__MR_URL__";
+    static char html[28672];
+    const char *needle_url = "__MR_URL__";
+    const char *needle_btn = "__APRS_BUTTON__";
     const char *url = wifi_get_current_url();
+    const char *btn = "";
+    const mr_board_info_t *b = mr_board_get();
 
-    char *pos;
-    size_t prefix_len, suffix_len;
+    if(b && b->has_gps){
+        btn = "<div class='card'><h3>APRS</h3><button onclick=\"location.href='/aprs'\">APRS Config</button></div>";
+    }
 
     httpd_resp_set_type(req, "text/html");
 
-    pos = strstr(INDEX_HTML, needle);
-    if (!pos) {
+    const char *p1 = strstr(INDEX_HTML, needle_url);
+    if(!p1){
         return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
     }
 
-    prefix_len = (size_t)(pos - INDEX_HTML);
-    suffix_len = strlen(pos + strlen(needle));
-
-    if (prefix_len + strlen(url) + suffix_len + 1 > sizeof(html)) {
+    size_t a_len = (size_t)(p1 - INDEX_HTML);
+    const char *after_url = p1 + strlen(needle_url);
+    const char *p2 = strstr(after_url, needle_btn);
+    if(!p2){
         return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
     }
 
-    memcpy(html, INDEX_HTML, prefix_len);
-    memcpy(html + prefix_len, url, strlen(url));
-    memcpy(html + prefix_len + strlen(url),
-           pos + strlen(needle),
-           suffix_len + 1);
+    size_t b_len = (size_t)(p2 - after_url);
+    const char *after_btn = p2 + strlen(needle_btn);
+    size_t c_len = strlen(after_btn);
+
+    size_t need = a_len + strlen(url) + b_len + strlen(btn) + c_len + 1;
+    if(need > sizeof(html)){
+        return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    }
+
+    char *w = html;
+    memcpy(w, INDEX_HTML, a_len); w += a_len;
+    memcpy(w, url, strlen(url)); w += strlen(url);
+    memcpy(w, after_url, b_len); w += b_len;
+    memcpy(w, btn, strlen(btn)); w += strlen(btn);
+    memcpy(w, after_btn, c_len); w += c_len;
+    *w = 0;
 
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
@@ -3260,6 +3295,63 @@ static void sensor_send_awake(void)
     // ACKREQ = true -> Relay antwortet sicherer
     send_data_to(g_relay_callsign_rt, "SENSOR1:AWAKE", true);
 }
+
+static void gps_send_periodic(void)
+{
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) ||     (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+
+    static uint32_t last_gps_send_ms = 0;
+    uint32_t tnow = now_ms();
+    uint32_t interval_ms = aprs_web_interval_ms();
+
+    if(interval_ms < 5000UL){
+        interval_ms = 60000UL;
+    }
+
+    if((tnow - last_gps_send_ms) < interval_ms){
+        return;
+    }
+
+    last_gps_send_ms = tnow;
+
+    aprs_cfg_t cfg;
+    aprs_cfg_from_local_web(&cfg);
+    if(!cfg.enabled){
+        ESP_LOGW(TAG, "APRSD send skipped: APRS disabled");
+        return;
+    }
+
+    char gps_txt[64];
+    mr_gps_get_text(gps_txt, sizeof(gps_txt));
+
+    if(gps_txt[0] == '\0'){
+        ESP_LOGW(TAG, "APRSD send skipped: empty GPS text");
+        return;
+    }
+
+    if(strstr(gps_txt, "no fix") || strstr(gps_txt, "NO FIX") ||
+       strstr(gps_txt, "NOFIX")  || strstr(gps_txt, "---") ||
+       strstr(gps_txt, "off")){
+        ESP_LOGW(TAG, "APRSD send skipped: %s", gps_txt);
+        return;
+    }
+
+    char body[80];
+    if(!aprs_build_body_from_gps_text(gps_txt, &cfg, body, sizeof(body))){
+        ESP_LOGW(TAG, "APRSD send skipped: GPS parse/build failed: %s", gps_txt);
+        return;
+    }
+
+    char msg[MAX_PLAINTEXT + 1];
+    if(!aprs_build_direct_msg(&cfg, body, msg, sizeof(msg))){
+        ESP_LOGW(TAG, "APRSD send skipped: direct message too long");
+        return;
+    }
+
+    send_data_to(g_relay_callsign_rt, msg, false);
+    ESP_LOGI(TAG, "APRSD sent to relay %s: %s", g_relay_callsign_rt, msg);
+#endif
+}
 // ============================================================================
 // =============================== HTTP start =================================
 // ============================================================================
@@ -3275,6 +3367,7 @@ static void http_start(void)
    OTA Update API registrieren
    ---------------------------------------------------------*/
     mr_wifi_ota_register(g_http);
+    aprs_web_register_http(g_http);
 
     httpd_uri_t u0 = { .uri="/",                .method=HTTP_GET,  .handler=index_get };
     httpd_register_uri_handler(g_http, &u0);
@@ -3700,24 +3793,25 @@ static void handle_rx(void)
                  my_str,
                  ((h->flags & MR_FLAG_SEC) ? 1 : 0));
             */
-        if(call7_eq(h->final_dst, my7)){        char txt[MAX_PAYLOAD+1]={0};
+        if(call7_eq(h->final_dst, my7)){
+            char txt[MAX_PAYLOAD+1]={0};
 
             if((h->flags & MR_FLAG_SEC) != 0){
                 char dbg_from[9];
                 call7_to_str(dbg_from, h->src);
 
-ESP_LOGW(TAG,
-         "SEC RX detected from=%s msg_id=%u seq=%u payload_len=%u",
-         dbg_from,
-         (unsigned)h->msg_id,
-         (unsigned)h->seq,
-         (unsigned)h->payload_len);
-                if(h->payload_len < SEC_TAG_LEN){
-                    xSemaphoreTake(g_mutex, portMAX_DELAY);
-                    sec_decrypt_fail++;
-                    xSemaphoreGive(g_mutex);
-                    return;
-                }
+                ESP_LOGW(TAG,
+                        "SEC RX detected from=%s msg_id=%u seq=%u payload_len=%u",
+                        dbg_from,
+                        (unsigned)h->msg_id,
+                        (unsigned)h->seq,
+                        (unsigned)h->payload_len);
+                                if(h->payload_len < SEC_TAG_LEN){
+                                    xSemaphoreTake(g_mutex, portMAX_DELAY);
+                                    sec_decrypt_fail++;
+                                    xSemaphoreGive(g_mutex);
+                                    return;
+                                }
 
                 xSemaphoreTake(g_mutex, portMAX_DELAY);
                 bool fresh = replay_check_locked(h->src, h->seq);
@@ -3791,6 +3885,68 @@ ESP_LOGW(TAG,
             xSemaphoreGive(g_mutex);
 
             ESP_LOGI(TAG,"DATA delivered ✅ from=%s rssi=%d \"%s\"", from_str, rssi, txt);
+
+            if(g_node_mode == NODE_RELAY && g_wifi_enabled){
+                aprs_cfg_t remote_cfg;
+                char aprs_body[96];
+
+                if(strncmp(txt, "APRSD ", 6) == 0){
+                    if(aprs_direct_parse_msg(txt, &remote_cfg, aprs_body, sizeof(aprs_body))){
+                        char packet[256];
+                        bool ok = aprs_build_packet_from_cfg(&remote_cfg, aprs_body, packet, sizeof(packet));
+                        if(ok){
+                            ok = aprs_send_packet_with_cfg(&remote_cfg, packet);
+                        }
+                        ESP_LOGI(TAG, "APRSD gateway from %s using %s: %s -> %s",
+                                 from_str, remote_cfg.callsign, aprs_body, ok ? "OK" : "FAIL");
+                    } else {
+                        ESP_LOGW(TAG, "APRSD parse failed from %s: %s", from_str, txt);
+                    }
+                }
+            }
+
+            char wx_str[16] = "";
+            float temp;
+
+            if (strstr(txt, "WX")) {
+                char *p = strstr(txt, "t=");
+                if (p && sscanf(p, "t=%f", &temp) == 1) {
+                    snprintf(wx_str, sizeof(wx_str), "T=%.2f C", temp);
+                }
+            }
+
+            char dt[20] = "";
+            char dt2[24] = "";
+            char line4[24] = "";
+            const char *line4_eff = line4;
+
+            mr_time_net_get_datetime(dt, sizeof(dt));
+
+            if (mr_time_net_get_datetime(dt, sizeof(dt))) {
+                snprintf(dt2, sizeof(dt2), "   %s", dt); 
+                line4_eff = dt2;
+            }
+
+            mr_display_clear();
+
+            char line3[24];
+
+            if (wx_str[0]) {
+                snprintf(line3, sizeof(line3), "rssi=%d %.10s", rssi, wx_str);
+            } else {
+                snprintf(line3, sizeof(line3), "rssi=%d", rssi);
+            }
+
+            mr_display_show_status8(
+                    "LAST RX",
+                    "",
+                    from_str,
+                    line3,
+                    "",
+                    line4_eff,
+                    "",
+                    ""
+                );
 
             app_handle_cmd_if_any(h->src, txt);
 
@@ -4460,8 +4616,24 @@ void app_main(void)
     gpio_hold_dis((gpio_num_t)BATT_EN_GPIO);
 #endif
 #endif
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+    gpio_deep_sleep_hold_dis();
+#ifdef BATT_EN_GPIO
+    gpio_hold_dis((gpio_num_t)BATT_EN_GPIO);
+#endif
+    gpio_hold_dis((gpio_num_t)VEXT_CTRL_PIN);
+#endif
+
+    mr_display_init();
+    mr_display_show_boot(MR_BOARD_NAME, "DISPLAY OK");
 
     mr_wifi_ota_confirm_running_image();
+
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+    (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+    mr_pmu_init();
+    mr_gps_init();
+#endif
 
     // ------------------------------------------------------------------------
     // 2) Mutex / NVS / Token Buckets / Key
@@ -4473,6 +4645,7 @@ void app_main(void)
     if(!g_lora_spi_mutex){ ESP_LOGE(TAG,"lora spi mutex failed"); abort(); }
 
     ESP_ERROR_CHECK(nvs_flash_init());
+    aprs_web_init();
 
     mr_init_msg_seq_from_rtc();
 
@@ -4532,13 +4705,7 @@ void app_main(void)
 
     mr_cfg_apply(&g_cfg);
 
-    #if MR_BME280_ENABLE
-        if(g_bme280_enable){
-            (void)bme280_init();
-        }
-    #endif
-
-config_print();
+    config_print();
 
 // ------------------------------------------------------------------------
 // 4) LoRa init (SPI + Chip)
@@ -4552,6 +4719,12 @@ config_print();
 #if MR_RELAY_ENABLE
     // falls relay_gpio aus NVS geladen wurde und sich geändert hat:
     gpio_hold_dis((gpio_num_t)g_relay_gpio_runtime);
+#endif
+
+#if MR_BME280_ENABLE
+        if(g_bme280_enable){
+            (void)bme280_init();
+        }
 #endif
 
     // IRQ line -> dio_task() -> handle_rx()
@@ -4574,27 +4747,6 @@ config_print();
     }else{
         ESP_LOGI(TAG,"WiFi/HTTP disabled at boot. Use CLI: wifi on");
     }
-
-/*#if MR_WIFI_STA_ENABLE
-
-    mr_wifi_sta_cfg_t sta_cfg = {0};
-
-    if(strlen(g_cfg.wifi_sta_ssid) > 0)
-    {
-        strncpy(sta_cfg.ssid, g_cfg.wifi_sta_ssid, sizeof(sta_cfg.ssid) - 1);
-        strncpy(sta_cfg.pass, g_cfg.wifi_sta_pass, sizeof(sta_cfg.pass) - 1);
-
-        sta_cfg.use_dhcp_hostname = MR_WIFI_STA_DHCP_HOSTNAME;
-
-        ESP_ERROR_CHECK(mr_wifi_sta_start(&sta_cfg));
-    }
-    else
-    {
-        ESP_LOGI("MR34","STA disabled (no SSID configured)");
-    }
-
-#endif
-*/
 
     // ------------------------------------------------------------------------
     // 6) Scheduler starten
@@ -4657,6 +4809,11 @@ uint32_t batt_mv = 0, batt_pct = 0;
 #endif
 #endif
 
+mr_display_show_status("MeshRadio",
+                       cfg_board_str(),
+                       cfg_lora_chip_str(),
+                       g_callsign_rt);
+
     char wx[160];
     strcpy(wx, "SENSOR:AWAKE");
 
@@ -4665,6 +4822,8 @@ uint32_t batt_mv = 0, batt_pct = 0;
             int32_t t_x100 = 0;
             uint32_t p_pa = 0;
             uint32_t rh_x1000 = 0;
+            //mr_display_sleep(false); // Display an, damit BME280 Werte angezeigt werden können (I2C-Bus aktiv)
+            //mr_display_init();
 
             if(bme280_read_weather(&t_x100, &p_pa, &rh_x1000)){
                 int32_t t_int  = t_x100 / 100;
@@ -4688,8 +4847,41 @@ uint32_t batt_mv = 0, batt_pct = 0;
                     rh_int, rh_frac,
                     batt_mv,
                     batt_pct);
+                    #if MR_DISPLAY_ENABLE
+                        {
+                            
+                            char l0[22], l1[22], l2[22], l3[22], l4[22], l5[22], l6[22], l7[22];
+
+                            snprintf(l0, sizeof(l0), "SENSOR AWAKE");
+                            snprintf(l1, sizeof(l1), "%s", g_callsign_rt);
+                            snprintf(l2, sizeof(l2), "Temp: %" PRId32 ".%02" PRId32 " C", t_int, t_frac);
+                            snprintf(l3, sizeof(l3), "Press:%" PRId32 " hPa", p_hpa);
+                            snprintf(l4, sizeof(l4), "Hum:  %" PRIu32 ".%02" PRIu32 " %%", rh_int, rh_frac);
+                            snprintf(l5, sizeof(l5), "Batt: %" PRIu32 " mV", batt_mv);
+                            snprintf(l6, sizeof(l6), "Batt: %" PRIu32 " %%", batt_pct);
+                            snprintf(l7, sizeof(l7), "WX OK");
+
+                            mr_display_show_status8(l0, l1, l2, l3, l4, l5, l6, l7);
+                        }
+                    #endif
+
             }else{
+                ESP_LOGE(TAG, "BME280 read failed, bme_ok=%d", bme280_is_ok() ? 1 : 0);
                 snprintf(wx, sizeof(wx), "SENSOR:AWAKE WX ERR");
+            
+            #if MR_DISPLAY_ENABLE
+                //mr_display_clear();
+                mr_display_show_status8(
+                    "SENSOR AWAKE",
+                    g_callsign_rt,
+                    "WX ERROR",
+                    bme280_is_ok() ? "BME read fail" : "BME init fail",
+                    "",
+                    "Check sensor",
+                    "and I2C bus",
+                    ""
+                );
+            #endif
             }
         }
 #endif
@@ -4721,6 +4913,10 @@ sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
 
     config_print();
 
+    //char dt[20] = "";
+    //mr_time_net_get_datetime(dt, sizeof(dt));
+
+    
 
     // ------------------------------------------------------------------------
     // 8) Main Loop
@@ -4732,6 +4928,45 @@ sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
         batt_poll();
         vTaskDelay(pdMS_TO_TICKS(50));
         batt_poll();
+#endif
+
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+    (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+        mr_gps_poll();
+        gps_send_periodic();
+#endif
+
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+    (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+        {
+            static uint32_t last_gps_ui_ms = 0;
+            uint32_t tnow = now_ms();
+
+            if((tnow - last_gps_ui_ms) >= 1000){
+                last_gps_ui_ms = tnow;
+
+                char gps_txt[64];
+                char nmea_dbg[128];
+
+                mr_gps_get_text(gps_txt, sizeof(gps_txt));
+                mr_gps_get_nmea_debug(nmea_dbg, sizeof(nmea_dbg));
+
+                //ESP_LOGI("GPS", "%s", gps_txt);
+                //ESP_LOGI("GPSRAW", "%s", nmea_dbg);
+
+                /*mr_display_clear();
+                mr_display_show_status8(
+                    "GPS TEST",
+                    mr_board_name(),
+                    gps_txt,
+                    "",
+                    "",
+                    "",
+                    "",
+                    ""
+                );*/
+            }
+        }
 #endif
 
         if(g_beacon_enabled && g_node_mode != NODE_SENSOR && now_ms() > g_next_beacon_ms){

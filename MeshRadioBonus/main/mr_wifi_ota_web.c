@@ -23,7 +23,7 @@ static esp_err_t ota_web_page_handler(httpd_req_t *req)
         "<head>"
         "  <meta charset='utf-8'>"
         "  <meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "  <title>MeshRadio OTA Update (c) 2023 Nerd-Verlag</title>"
+        "  <title>MeshRadio OTA Update (c) 2026 Nerd-Verlag</title>"
         "  <style>"
         "    body{font-family:Arial,Helvetica,sans-serif;background:#0f172a;color:#e5e7eb;"
         "         margin:0;padding:24px;}"
@@ -50,7 +50,7 @@ static esp_err_t ota_web_page_handler(httpd_req_t *req)
         "</head>"
         "<body>"
         "  <div class='card'>"
-        "    <h1>MeshRadio OTA Update (c) 2023 Nerd-Verlag</h1>"
+        "    <h1>MeshRadio OTA Update (c) 2026 Nerd-Verlag</h1>"
         "    <p>Firmware direkt im Browser hochladen. Bitte nur eine passende <code>.bin</code>-Datei verwenden.</p>"
 
         "    <div class='row box'>"

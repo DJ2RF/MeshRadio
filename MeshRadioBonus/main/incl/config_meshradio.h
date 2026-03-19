@@ -79,26 +79,29 @@
 /*
  * MR_BOARD_LILYGO_SX1276:
  *   - ESP32 + SX1276/SX1278 (Register-Driver)
- *   - Beispiele: LILYGO/TTGO T3, T-Beam Varianten etc.
+ *   - Beispiele: LILYGO/TTGO T3, ältere T-Beam-kompatible Layouts
  *
  * MR_BOARD_HELTEC_V3:
  *   - ESP32-S3 + SX1262 (Command-Driver)
  *   - Beispiele: Heltec LoRa 32 V3.x / V3.2
+ *
+ * MR_BOARD_TBEAM_V11_SX1276:
+ *   - ESP32 + SX1276 + GPS
+ *
+ * MR_BOARD_TBEAM_V12_AXP2101:
+ *   - ESP32 + SX1276 + GPS + AXP2101
  */
-#define MR_BOARD_LILYGO_SX1276   1
-#define MR_BOARD_HELTEC_V3       2
+#define MR_BOARD_LILYGO_SX1276      1
+#define MR_BOARD_HELTEC_V3          2
+#define MR_BOARD_TBEAM_V11_SX1276   3
+#define MR_BOARD_TBEAM_V12_AXP2101  4
 
 /*
  * MR_BOARD_PRESET:
- *   - Auswahl des aktiven Boards (1 von 2 Presets)
- *   - Umschalten hier bestimmt Pinout, LoRa-Chip-Treiber und Board-Fixes.
- *  
- * - Wichtig: Bei Änderung hier auch die entsprechende Board-Auswahl in der
- *  Build-Konfiguration (KConfig) anpassen, damit die richtigen Quellen kompiliert
- *  werden.
+ *   - Auswahl des aktiven Boards
  */
 #ifndef MR_BOARD_PRESET
-#define MR_BOARD_PRESET MR_BOARD_LILYGO_SX1276  // <-- HIER UMSCHALTEN
+#define MR_BOARD_PRESET MR_BOARD_LILYGO_SX1276
 #endif
 
 /* -----------------------------------------------------------
@@ -110,10 +113,15 @@
 #elif MR_BOARD_PRESET == MR_BOARD_HELTEC_V3
 #define MR_BOARD_NAME "Heltec V3"
 
+#elif MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276
+#define MR_BOARD_NAME "T-Beam V1.1 SX1276"
+
+#elif MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101
+#define MR_BOARD_NAME "T-Beam V1.2 AXP2101"
+
 #else
 #define MR_BOARD_NAME "Unknown Board"
 #endif
-
 // ---- Callsign / WiFi ----
 /*
  * g_callsign:
