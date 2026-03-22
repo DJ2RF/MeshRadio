@@ -226,6 +226,7 @@ static uint16_t g_msg_id=0;
 static uint16_t g_my_seq=0;
 // ---- Relay state über DeepSleep behalten ----
 RTC_DATA_ATTR static uint8_t rtc_relay_state = 0;
+RTC_DATA_ATTR static uint8_t rtc_display_enable = 1;
 
 static spi_device_handle_t lora_spi;
 static QueueHandle_t dio_q;
@@ -385,11 +386,13 @@ static void config_print(void)
              node_mode_str(g_node_mode),
              g_cfg.powersave_enable ? 1 : 0);
 
-    ESP_LOGI(TAG, "CFG: relay_en=%u relay_gpio=%d batt_en=%u bme280=%u cli=%u",
+    ESP_LOGI(TAG, "CFG: relay_en=%u relay_gpio=%d batt_en=%u bme280=%u display_cfg=%u display_rt=%u cli=%u",
              (unsigned)MR_RELAY_ENABLE,
              (int)g_relay_gpio_runtime,
              (unsigned)MR_BATT_ENABLE,
              (unsigned)MR_BME280_ENABLE,
+             g_cfg.display_enable ? 1 : 0,
+             g_display_enabled ? 1 : 0,
              (unsigned)MR_CLI_ENABLE);
 
     ESP_LOGI(TAG, "CFG: ssid=%s beacon=%lu routeadv=%u topn=%u delta=%u hold=%lu cad=%u",
@@ -512,22 +515,23 @@ static void prog_button_poll(void)
         last_ms = t;
 
         if (last == 1 && level == 0) {
-            g_display_enabled = !g_display_enabled;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            g_cfg.display_enable = !g_cfg.display_enable;
+            rtc_display_enable = g_cfg.display_enable ? 1 : 0;
+            (void)mr_cfg_save_nvs(&g_cfg);
+            mr_cfg_apply(&g_cfg);
+            xSemaphoreGive(g_mutex);
 
             if (g_display_enabled) {
-                mr_display_init();
-                mr_display_sleep(false);
                 mr_display_show_status(
                     "DISPLAY ON",
                     cfg_board_str(),
                     cfg_lora_chip_str(),
                     g_callsign_rt
                 );
-                ESP_LOGI(TAG, "PROG button: display ON");
+                ESP_LOGI(TAG, "PROG button: display ON (persisted)");
             } else {
-                mr_display_sleep(true);
-                //mr_display_power(false);
-                ESP_LOGI(TAG, "PROG button: display OFF");
+                ESP_LOGI(TAG, "PROG button: display OFF (persisted)");
             }
         }
 
@@ -558,9 +562,10 @@ static void heltec_vext_on(void)
 static void board_power_boot_init(void)
 {
 #if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
-    // VEXT ON (LOW)
+    // VEXT according to last retained display state
+    // Heltec: LOW = ON, HIGH = OFF
     gpio_set_direction((gpio_num_t)VEXT_CTRL_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)VEXT_CTRL_PIN, 0);
+    gpio_set_level((gpio_num_t)VEXT_CTRL_PIN, rtc_display_enable ? 0 : 1);
 
     // Battery divider enable pin init (default OFF!)
     gpio_set_direction((gpio_num_t)BATT_EN_GPIO, GPIO_MODE_OUTPUT);
@@ -618,21 +623,21 @@ static void pwr_button_poll(void)
         last_change_ms = tnow;
 
         if (last_level == 1 && level == 0) {
-            g_display_enabled = !g_display_enabled;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            g_cfg.display_enable = !g_cfg.display_enable;
+            rtc_display_enable = g_cfg.display_enable ? 1 : 0;
+            (void)mr_cfg_save_nvs(&g_cfg);
+            mr_cfg_apply(&g_cfg);
+            xSemaphoreGive(g_mutex);
 
             if (g_display_enabled) {
-                //mr_display_power(true);
-                mr_display_init();
-                mr_display_sleep(false);
-                ESP_LOGI(TAG, "PWR button: display ON");
+                ESP_LOGI(TAG, "PWR button: display ON (persisted)");
                 mr_display_show_status("DISPLAY ON",
                            cfg_board_str(),
                            cfg_lora_chip_str(),
                            g_callsign_rt);
             } else {
-                mr_display_sleep(true);
-                //mr_display_power(false);
-                ESP_LOGI(TAG, "PWR button: display OFF");
+                ESP_LOGI(TAG, "PWR button: display OFF (persisted)");
             }
         }
 
@@ -3158,11 +3163,12 @@ static esp_err_t api_status_get(httpd_req_t *req)
         "TX: beacon=%" PRIu32 " adv=%" PRIu32 " ack=%" PRIu32 " data=%" PRIu32 "\n"
         "DEFER: beacon=%" PRIu32 " adv=%" PRIu32 " ack=%" PRIu32 " data=%" PRIu32 "\n"
         "DROP: adv=%" PRIu32 " data=%" PRIu32 "\n"
-        "WIFI: %s  HTTP: %s\n",
+        "DISPLAY: %s  WIFI: %s  HTTP: %s\n",
         node_mode_str(g_node_mode), (int)g_node_mode,
         c_tx_beacon, c_tx_routeadv, c_tx_ack, c_tx_data,
         c_defer_beacon, c_defer_routeadv, c_defer_ack, c_defer_data,
         c_drop_routeadv, c_drop_data,
+        g_display_enabled ? "ON" : "OFF",
         g_wifi_enabled ? "ON" : "OFF",
         g_http_running ? "ON" : "OFF"
     );
@@ -3198,6 +3204,8 @@ static esp_err_t api_status_get(httpd_req_t *req)
         "\"chip\":\"%s\","
         "\"fw\":\"%s\","
         "\"proto\":%u,"
+        "\"display\":%u,"
+        "\"display_cfg\":%u,"
         "\"wifi\":%u,"
         "\"relay\":%u,"
         "\"batt\":\"%s\","
@@ -3210,6 +3218,8 @@ static esp_err_t api_status_get(httpd_req_t *req)
         cfg_lora_chip_str(),
         esp_app_get_description()->version,
         (unsigned)MR_PROTO_VERSION,
+        g_display_enabled ? 1 : 0,
+        g_cfg.display_enable ? 1 : 0,
         g_wifi_enabled ? 1 : 0,
 #if MR_RELAY_ENABLE
         g_relay_on ? 1 : 0,
@@ -3720,13 +3730,14 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
 #endif
         char ans[240];
         snprintf(ans,sizeof(ans),
-                 "STATUS: mode=%s relay=%s wifi=%s http=%s crypto=%s batt=%" PRIu32 "mV/%" PRIu32 "%%",
+                 "STATUS: mode=%s relay=%s display=%s wifi=%s http=%s crypto=%s batt=%" PRIu32 "mV/%" PRIu32 "%%",
                  node_mode_str(g_node_mode),
 #if MR_RELAY_ENABLE
                  g_relay_on?"ON":"OFF",
 #else
                  "N/A",
 #endif
+                 g_display_enabled?"ON":"OFF",
                  g_wifi_enabled?"ON":"OFF",
                  g_http_running?"ON":"OFF",
                  g_crypto_enable?"ON":"OFF",
@@ -3756,6 +3767,8 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
     if(strcmp(txt, "CMD:DISPLAY ON")==0){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.display_enable = true;
+        rtc_display_enable = 1;
+        (void)mr_cfg_save_nvs(&g_cfg);
         mr_cfg_apply(&g_cfg);
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "DISPLAY: ON");
@@ -3765,6 +3778,8 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
     if(strcmp(txt, "CMD:DISPLAY OFF")==0){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.display_enable = false;
+        rtc_display_enable = 0;
+        (void)mr_cfg_save_nvs(&g_cfg);
         mr_cfg_apply(&g_cfg);
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "DISPLAY: OFF");
@@ -3772,20 +3787,24 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
     }
 
     if(strcmp(txt, "CMD:WIFI ON")==0){
+        bool ok=false;
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.wifi_enable = true;
+        ok = mr_cfg_save_nvs(&g_cfg);
         mr_cfg_apply(&g_cfg);
         xSemaphoreGive(g_mutex);
-        app_send_reply_to_sender(from7, "WIFI: ON");
+        app_send_reply_to_sender(from7, ok ? "WIFI: ON" : "WIFI: ON (NOT SAVED)");
         return;
     }
 
     if(strcmp(txt, "CMD:WIFI OFF")==0){
+        bool ok=false;
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.wifi_enable = false;
+        ok = mr_cfg_save_nvs(&g_cfg);
         mr_cfg_apply(&g_cfg);
         xSemaphoreGive(g_mutex);
-        app_send_reply_to_sender(from7, "WIFI: OFF");
+        app_send_reply_to_sender(from7, ok ? "WIFI: OFF" : "WIFI: OFF (NOT SAVED)");
         return;
     }
 
@@ -4247,26 +4266,28 @@ static void handle_rx(void)
                 line4_eff = dt2;
             }
 
-            mr_display_clear();
+            if (g_display_enabled) {
+                mr_display_clear();
 
-            char line3[24];
+                char line3[24];
 
-            if (wx_str[0]) {
-                snprintf(line3, sizeof(line3), "rssi=%d %.10s", rssi, wx_str);
-            } else {
-                snprintf(line3, sizeof(line3), "rssi=%d", rssi);
+                if (wx_str[0]) {
+                    snprintf(line3, sizeof(line3), "rssi=%d %.10s", rssi, wx_str);
+                } else {
+                    snprintf(line3, sizeof(line3), "rssi=%d", rssi);
+                }
+
+                mr_display_show_status8(
+                        "LAST RX",
+                        "",
+                        from_str,
+                        line3,
+                        "",
+                        line4_eff,
+                        "",
+                        ""
+                    );
             }
-
-            mr_display_show_status8(
-                    "LAST RX",
-                    "",
-                    from_str,
-                    line3,
-                    "",
-                    line4_eff,
-                    "",
-                    ""
-                );
 
             app_handle_cmd_if_any(h->src, txt);
 
@@ -4500,8 +4521,9 @@ static void cli_handle_line(char *line)
         batt_pct = g_batt_pct;
         xSemaphoreGive(g_mutex);
 #endif
-        printf("local: mode=%s wifi=%s http=%s crypto=%s batt=%" PRIu32 "mV/%" PRIu32 "%%\n",
+        printf("local: mode=%s display=%s wifi=%s http=%s crypto=%s batt=%" PRIu32 "mV/%" PRIu32 "%%\n",
                node_mode_str(g_node_mode),
+               g_display_enabled?"ON":"OFF",
                g_wifi_enabled?"ON":"OFF",
                g_http_running?"ON":"OFF",
                g_crypto_enable?"ON":"OFF",
@@ -4514,9 +4536,38 @@ static void cli_handle_line(char *line)
 
     if(streq_ci(cmd,"wifi")){
         char *arg=strtok_r(NULL, " \t", &save);
-        if(arg && streq_ci(arg,"on")){ set_wifi_enabled(true); printf("OK wifi=ON\n"); return; }
-        if(arg && streq_ci(arg,"off")){ set_wifi_enabled(false); printf("OK wifi=OFF\n"); return; }
-        printf("ERR wifi on|off\n");
+        bool ok=false;
+        bool save_ok=false;
+
+        if(!arg){
+            printf("ERR wifi on|off\n");
+            return;
+        }
+
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+
+        if(streq_ci(arg,"on")){
+            g_cfg.wifi_enable = true;
+            save_ok = mr_cfg_save_nvs(&g_cfg);
+            mr_cfg_apply(&g_cfg);
+            ok = true;
+        }
+        else if(streq_ci(arg,"off")){
+            g_cfg.wifi_enable = false;
+            save_ok = mr_cfg_save_nvs(&g_cfg);
+            mr_cfg_apply(&g_cfg);
+            ok = true;
+        }
+
+        xSemaphoreGive(g_mutex);
+
+        if(!ok){
+            printf("ERR wifi on|off\n");
+            return;
+        }
+
+        printf(save_ok ? "OK wifi=%s\n" : "OK wifi=%s (NOT SAVED)\n",
+               g_cfg.wifi_enable ? "ON" : "OFF");
         return;
     }
 
@@ -4876,6 +4927,8 @@ static void mr_enter_deep_sleep(uint32_t sleep_ms)
     lora_prepare_for_deep_sleep();
 
     // Board rails off (Heltec VEXT etc.)
+    rtc_display_enable = g_cfg.display_enable ? 1 : 0;
+
     board_prepare_for_deep_sleep();
 
     // Wake timer
@@ -5020,6 +5073,8 @@ void app_main(void)
     }else{
         ESP_LOGI(TAG,"No NVS config, using defaults");
     }
+
+    rtc_display_enable = g_cfg.display_enable ? 1 : 0;
 
     // ------------------------------------------------------------------------
     // 3) Station Addons (Relay GPIO, Battery ADC)

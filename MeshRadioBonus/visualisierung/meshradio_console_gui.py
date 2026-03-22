@@ -3,30 +3,41 @@
 
 """
 MeshRadio Console GUI
----------------------
+=====================
 
-Live monitoring and control console for MeshRadio nodes.
+Live-Monitoring- und Steuerkonsole für MeshRadio-Nodes.
 
-Features
---------
-- Live plots for:
-    * Temperature
-    * Pressure
-    * Humidity
-    * Battery voltage (mV)
-    * Battery charge (%)
+Funktionen
+----------
+- Live-Plots für:
+    * Temperatur
+    * Luftdruck
+    * Luftfeuchte
+    * Batteriespannung (mV)
+    * Batteriestand (%)
     * RSSI
     * Link Quality
-- Battery monitoring
-- Command console
-- Auto command on next AWAKE
-- Link Quality display (based on RSSI)
-- Node list with last seen timestamps
-- TX window protection
-- Help button with online documentation link
+- Battery Monitoring
+- Command Console
+- One-shot Auto Command beim nächsten AWAKE
+- Link-Quality-Anzeige auf Basis des RSSI
+- Node-Liste mit Last-Seen-Zeiten
+- TX-Window-Schutz
+- Help-Button mit Online-Dokumentation
+- RX-Textlog mit DST-Filter
 
-Author
-------
+Wichtige Änderungen in dieser Version
+------------------------------------
+1. Die Quick-Buttons bleiben unverändert.
+2. Die Auto-Command-Auswahl wurde erweitert.
+3. Das RX-Log zeigt nur:
+   - gesendete Kommandos (send ...)
+   - "OK sent" direkt nach dem Senden
+   - Antworten vom aktuell überwachten DST (from=<DST>)
+4. Warnungen und Fehlerzeilen ("| W " / "| E ") werden unterdrückt.
+
+Autor
+-----
 Friedrich Riedhammer DJ2RF
 
 Copyright
@@ -35,7 +46,7 @@ Copyright
 fritz@nerdverlag.com
 https://nerdverlag.com
 
-For educational / amateur radio use
+Für Ausbildungs-, Experimentier- und Amateurfunkzwecke.
 """
 
 import argparse
@@ -58,7 +69,7 @@ import tkinter as tk
 from tkinter import ttk
 
 
-VERSION = "MRVIS v2.1 (c) nerdverlag.com"
+VERSION = "MRVIS v2.4 (c) nerdverlag.com"
 HELP_URL = "https://nerdverlag.com/?page_id=719"
 
 # ---------------------------------------------------------------------
@@ -79,6 +90,7 @@ WX_RE = re.compile(
 
 RSSI_RE = re.compile(r"\b(?:RSSI|rssi)\s*[:=]\s*(?P<rssi>-?\d+)\b")
 FROM_RE = re.compile(r"\bfrom\s*[:=]\s*(?P<call>[A-Za-z0-9/_-]+)")
+SEND_RE = re.compile(r"^send\s+(?P<dst>\S+)\s+(?P<ack>[01])\s+(?P<payload>.+)$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------
@@ -92,45 +104,14 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    ap.add_argument(
-        "--port",
-        default="COM16",
-        help="Serial port of the MeshRadio device",
-    )
-    ap.add_argument(
-        "--baud",
-        type=int,
-        default=115200,
-        help="Serial baud rate",
-    )
-    ap.add_argument(
-        "--timeout",
-        type=float,
-        default=0.2,
-        help="Serial read timeout in seconds",
-    )
-    ap.add_argument(
-        "--window",
-        type=int,
-        default=30,
-        help="TX window duration in seconds after AWAKE",
-    )
-    ap.add_argument(
-        "--dst",
-        default="DL1ABCF-1",
-        help="Default destination callsign/node ID",
-    )
-    ap.add_argument(
-        "--max-points",
-        type=int,
-        default=300,
-        help="Maximum number of plot history samples",
-    )
-    ap.add_argument(
-        "--always-allow-tx",
-        action="store_true",
-        help="Allow TX even when TX window is closed",
-    )
+    ap.add_argument("--port", default="COM16", help="Serial port of the MeshRadio device")
+    ap.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
+    ap.add_argument("--timeout", type=float, default=0.2, help="Serial read timeout in seconds")
+    ap.add_argument("--window", type=int, default=30, help="TX window duration in seconds after AWAKE")
+    ap.add_argument("--dst", default="DL1ABCF-1", help="Default destination callsign/node ID")
+    ap.add_argument("--max-points", type=int, default=300, help="Maximum number of plot history samples")
+    ap.add_argument("--rx-log-lines", type=int, default=300, help="Maximum number of lines kept in the RX text log")
+    ap.add_argument("--always-allow-tx", action="store_true", help="Allow TX even when TX window is closed")
 
     return ap.parse_args()
 
@@ -140,7 +121,7 @@ def parse_args():
 # ---------------------------------------------------------------------
 
 class Shared:
-    def __init__(self, max_points: int):
+    def __init__(self, max_points: int, rx_log_lines: int):
         self.lock = threading.Lock()
         self.running = True
         self.ser = None
@@ -167,6 +148,13 @@ class Shared:
         # call -> {"last_seen": datetime, "rssi": int|None, "last_line": str}
         self.nodes = {}
 
+        # RX/TX monitor log lines as strings "HH:MM:SS | payload"
+        self.rx_log = deque(maxlen=rx_log_lines)
+
+        # Aktuell überwachte Gegenstelle für das RX-Log
+        self.monitor_dst = ""
+        self.last_tx_ts = None
+
 
 S: Shared | None = None
 
@@ -180,6 +168,16 @@ def make_send_cmd(dst: str, ack: int, payload: str) -> str:
     ack = 1 if ack else 0
     payload = (payload or "").strip()
     return f"send {dst} {ack} {payload}"
+
+
+def append_rx_log(line: str):
+    """Hängt eine Zeile an das sichtbare TX/RX-Monitorlog an."""
+    global S
+    assert S is not None
+
+    ts = dt.datetime.now().strftime("%H:%M:%S")
+    with S.lock:
+        S.rx_log.append(f"{ts} | {line}")
 
 
 def send_cli_line(line: str) -> bool:
@@ -196,10 +194,18 @@ def send_cli_line(line: str) -> bool:
     if not line.endswith("\n"):
         line += "\n"
 
+    clean_line = line.strip()
+    m = SEND_RE.match(clean_line)
+    if m:
+        with S.lock:
+            S.monitor_dst = (m.group("dst") or "").strip()
+            S.last_tx_ts = dt.datetime.now()
+        append_rx_log(clean_line)
+
     try:
         ser.write(line.encode("utf-8"))
         ser.flush()
-        print(f"[TX] {line.strip()}")
+        print(f"[TX] {clean_line}")
         return True
     except Exception as e:
         print(f"[ERR] TX failed: {e}")
@@ -233,6 +239,42 @@ def rssi_to_quality(rssi: int | None) -> tuple[int | None, str]:
     filled = int(round(q / 100 * blocks))
     bar = "█" * filled + "░" * (blocks - filled)
     return q, bar
+
+
+def should_show_in_rx_log(line: str) -> bool:
+    """
+    Sichtbares RX/TX-Monitorlog:
+    - send <dst> ...                     -> sichtbar (wird in send_cli_line geloggt)
+    - OK sent                            -> sichtbar, kurz nach lokalem TX
+    - Antworten vom überwachten DST      -> sichtbar, falls from=<monitor_dst>
+    - W/E Debugmeldungen                 -> unsichtbar
+    - alles andere                       -> unsichtbar
+    """
+    global S
+    assert S is not None
+
+    if not line:
+        return False
+
+    # Warnungen/Fehler komplett ausblenden
+    if "| W " in line or "| E " in line:
+        return False
+
+    with S.lock:
+        monitor_dst = (S.monitor_dst or "").strip()
+        last_tx_ts = S.last_tx_ts
+
+    # Lokale Sendebestätigung kurz nach einem TX anzeigen
+    if "OK sent" in line:
+        if last_tx_ts and (dt.datetime.now() - last_tx_ts).total_seconds() <= 5:
+            return True
+        return False
+
+    # Nur Antworten vom aktuell überwachten Zielnode anzeigen
+    if monitor_dst and f"from={monitor_dst}" in line:
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------
@@ -274,11 +316,11 @@ def serial_reader(args):
         if not line:
             continue
 
+        if should_show_in_rx_log(line):
+            append_rx_log(line)
+
         awake = AWAKE_RE.search(line)
         wxm = WX_RE.search(line)
-
-        if not awake and not wxm:
-            continue
 
         rssi = None
         rm = RSSI_RE.search(line)
@@ -555,10 +597,7 @@ def start_control_window(args, root):
     lblStatus.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def set_status(msg: str, ok: bool = True):
-        lblStatus.config(
-            text=f"status: {msg}",
-            foreground=("#228822" if ok else "#aa3333"),
-        )
+        lblStatus.config(text=f"status: {msg}", foreground=("#228822" if ok else "#aa3333"))
 
     def open_help():
         try:
@@ -593,19 +632,16 @@ def start_control_window(args, root):
         else:
             set_status("TX failed (serial not ready?)", ok=False)
 
-    ttk.Button(
-        frmMid,
-        text="SEND (ACK=1)",
-        command=lambda: guarded_send(varPay.get())
-    ).grid(row=0, column=4, sticky="e", padx=(0, 6))
-
-    ttk.Button(frmMid, text="HELP", command=open_help).grid(
-        row=0, column=5, sticky="e"
+    ttk.Button(frmMid, text="SEND (ACK=1)", command=lambda: guarded_send(varPay.get())).grid(
+        row=0, column=4, sticky="e", padx=(0, 6)
     )
+
+    ttk.Button(frmMid, text="HELP", command=open_help).grid(row=0, column=5, sticky="e")
 
     def mkbtn(txt, payload):
         return ttk.Button(frmBot, text=txt, command=lambda: guarded_send(payload))
 
+    # Quick-Buttons bleiben absichtlich unverändert
     for i, b in enumerate(
         [
             mkbtn("RELAY ON", "CMD:RELAY ON"),
@@ -618,9 +654,20 @@ def start_control_window(args, root):
         frmBot.columnconfigure(i, weight=1)
 
     AUTO_COMMANDS = [
+        "CMD:STATUS?",
+        "CMD:DISPLAY ON",
+        "CMD:DISPLAY OFF",
+        "CMD:WIFI ON",
+        "CMD:WIFI OFF",
+        "CMD:GPS",
+        "CMD:BATT",
+        "CMD:VERSION",
+        "CMD:REBOOT",
         "CMD:RELAY ON",
         "CMD:RELAY OFF",
         "CMD:RELAY TOGGLE",
+        "CMD:CRYPTO ON",
+        "CMD:CRYPTO OFF",
     ]
 
     varAuto = tk.StringVar(value=AUTO_COMMANDS[0])
@@ -654,7 +701,12 @@ def start_control_window(args, root):
 
     frmNodes = ttk.LabelFrame(root, text="Nodes (last seen)", padding=10)
     frmNodes.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    frmRx = ttk.LabelFrame(root, text="DST Monitor Log", padding=10)
+    frmRx.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
     root.grid_rowconfigure(5, weight=1)
+    root.grid_rowconfigure(6, weight=1)
     root.grid_columnconfigure(0, weight=1)
 
     cols = ("call", "last_seen", "rssi", "lq")
@@ -678,6 +730,20 @@ def start_control_window(args, root):
     frmNodes.columnconfigure(0, weight=1)
     frmNodes.rowconfigure(0, weight=1)
 
+    txtRx = tk.Text(frmRx, height=10, wrap="none", font=("Consolas", 10))
+    txtRx.grid(row=0, column=0, sticky="nsew")
+    txtRx.configure(state="disabled")
+
+    rx_vsb = ttk.Scrollbar(frmRx, orient="vertical", command=txtRx.yview)
+    rx_hsb = ttk.Scrollbar(frmRx, orient="horizontal", command=txtRx.xview)
+    txtRx.configure(yscrollcommand=rx_vsb.set, xscrollcommand=rx_hsb.set)
+
+    rx_vsb.grid(row=0, column=1, sticky="ns")
+    rx_hsb.grid(row=1, column=0, sticky="ew")
+    frmRx.columnconfigure(0, weight=1)
+    frmRx.rowconfigure(0, weight=1)
+
+    last_rx_render = {"text": ""}
     sent_until = {"ts": None}
 
     def ui_set_disarmed():
@@ -693,10 +759,7 @@ def start_control_window(args, root):
         if len(short_payload) > 14:
             short_payload = short_payload[:14] + "…"
 
-        lblAutoState.config(
-            text=f"ARMED {short_dst} ← {short_payload}",
-            bg="#228822"
-        )
+        lblAutoState.config(text=f"ARMED {short_dst} ← {short_payload}", bg="#228822")
         sent_until["ts"] = None
 
     def ui_set_sent(info: str):
@@ -788,6 +851,19 @@ def start_control_window(args, root):
             except Exception:
                 pass
 
+    def refresh_rx_log(rx_lines: list[str]):
+        text = "\n".join(rx_lines)
+        if text == last_rx_render["text"]:
+            return
+
+        txtRx.configure(state="normal")
+        txtRx.delete("1.0", "end")
+        if text:
+            txtRx.insert("1.0", text)
+        txtRx.see("end")
+        txtRx.configure(state="disabled")
+        last_rx_render["text"] = text
+
     def tick():
         ok, left = tx_window_ok(args.window)
         if ok:
@@ -805,6 +881,8 @@ def start_control_window(args, root):
             sent_pl = S.auto_last_sent_payload
             lrssi = S.last_rssi
             nodes_snapshot = dict(S.nodes)
+            rx_lines = list(S.rx_log)
+            monitor_dst = S.monitor_dst or args.dst
 
         q, bar = rssi_to_quality(lrssi)
         if q is None:
@@ -814,10 +892,11 @@ def start_control_window(args, root):
 
         try:
             refresh_nodes_table(nodes_snapshot)
+            refresh_rx_log(rx_lines)
         except Exception:
             pass
 
-        lblDbg.config(text=f"debug: auto_armed={1 if armed else 0}")
+        lblDbg.config(text=f"debug: auto_armed={1 if armed else 0} monitor_dst='{monitor_dst}'")
 
         if sent_ts is not None:
             ui_set_sent(sent_pl)
@@ -856,9 +935,10 @@ def start_control_window(args, root):
 def main():
     global S
     args = parse_args()
-    S = Shared(max_points=args.max_points)
+    S = Shared(max_points=args.max_points, rx_log_lines=args.rx_log_lines)
 
     root = tk.Tk()
+    root.geometry("1200x980")
 
     th = threading.Thread(target=serial_reader, args=(args,), daemon=True)
     th.start()
