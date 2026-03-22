@@ -44,6 +44,8 @@ extern "C" {
 #define APRS_PASSCODE_MAX 16
 #define APRS_COMMENT_MAX  64
 #define APRS_HOST_MAX     64
+#define APRS_LAT_MAX      20
+#define APRS_LON_MAX      20
 
 typedef struct {
     bool enabled;
@@ -54,6 +56,9 @@ typedef struct {
     char comment[APRS_COMMENT_MAX];
     char host[APRS_HOST_MAX];
     uint16_t port;
+    bool use_static_pos;
+    char latitude[APRS_LAT_MAX];
+    char longitude[APRS_LON_MAX];
 } aprs_cfg_t;
 
 bool aprs_build_packet_from_cfg(const aprs_cfg_t *cfg,

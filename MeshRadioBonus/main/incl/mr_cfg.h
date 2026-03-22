@@ -49,7 +49,8 @@ typedef struct {
     bool     relay_feature_enable;
     int8_t   relay_gpio;
     // Wetterdaten GPIO's Fest / Target
-    bool bme280_enable;
+    bool     bme280_enable;
+    bool     display_enable;
 } mr_cfg_t;
 
 extern mr_cfg_t g_cfg;

@@ -205,6 +205,7 @@
 #define PIN_GPS_TX          12
 #define PIN_GPS_RX          34
 #define PIN_GPS_PPS         37
+#define PIN_PWR_BUTTON      38
 
 #elif (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
 
@@ -231,6 +232,7 @@
 #define PIN_GPS_TX          12
 #define PIN_GPS_RX          34
 #define PIN_GPS_PPS         (-1)
+#define PIN_PWR_BUTTON      38
 
 // Kompatibilitäts-Makros für alten Battery-Code in main.c
 // Akku später über AXP2101 / mr_pmu.c lesen

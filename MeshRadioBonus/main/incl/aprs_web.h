@@ -14,6 +14,8 @@ extern "C" {
 #define APRS_WEB_PASSCODE_MAX  16
 #define APRS_WEB_COMMENT_MAX   64
 #define APRS_WEB_HOST_MAX      64
+#define APRS_WEB_LAT_MAX       20
+#define APRS_WEB_LON_MAX       20
 
 typedef struct {
     bool enabled;
@@ -25,6 +27,9 @@ typedef struct {
     char host[APRS_WEB_HOST_MAX];
     uint16_t port;
     uint32_t interval_ms;
+    bool use_static_pos;
+    char latitude[APRS_WEB_LAT_MAX];
+    char longitude[APRS_WEB_LON_MAX];
 } aprs_web_cfg_t;
 
 void aprs_web_init(void);
@@ -40,6 +45,9 @@ const char *aprs_web_comment(void);
 const char *aprs_web_host(void);
 uint16_t aprs_web_port(void);
 uint32_t aprs_web_interval_ms(void);
+bool aprs_web_use_static_pos(void);
+const char *aprs_web_latitude(void);
+const char *aprs_web_longitude(void);
 void aprs_web_get_cfg(aprs_web_cfg_t *out);
 
 #ifdef __cplusplus

@@ -52,6 +52,7 @@ extern bool g_routeadv_enable;
 extern bool g_cad_enable;
 extern bool g_powersave_enable;
 extern bool g_bme280_enable;
+extern bool g_display_enabled;
 
 extern uint32_t g_beacon_interval_ms;
 extern uint8_t  g_routeadv_topn;
@@ -61,6 +62,10 @@ extern uint8_t  g_net_key[16];
 
 extern int8_t g_relay_gpio_runtime;
 extern void relay_init(void);
+
+extern void mr_display_power(bool on);
+extern esp_err_t mr_display_init(void);
+extern esp_err_t mr_display_sleep(bool en);
 
 /* node_mode_t liegt in main.c; int ist ABI-seitig hier ausreichend */
 extern int g_node_mode;
@@ -210,6 +215,7 @@ void mr_cfg_defaults(mr_cfg_t *c)
     c->sensor_wake_period_ms = SENSOR_WAKE_PERIOD_MS;
     c->sensor_boot_rx_window_ms = SENSOR_BOOT_RX_WINDOW_MS;
     c->bme280_enable = false; /* absichtlich konservativ */
+    c->display_enable = true;
 
     c->relay_feature_enable = (MR_RELAY_ENABLE ? true : false);
     c->relay_gpio = RELAY_GPIO;
@@ -336,6 +342,7 @@ void mr_cfg_apply(const mr_cfg_t *c)
     g_routeadv_enable  = c->routeadv_enable;
     g_cad_enable       = c->cad_enable;
     g_powersave_enable = c->powersave_enable;
+    g_display_enabled  = c->display_enable;
 
     g_beacon_interval_ms = c->beacon_interval_ms;
     g_routeadv_topn      = c->routeadv_topn;
@@ -373,6 +380,16 @@ void mr_cfg_apply(const mr_cfg_t *c)
         set_wifi_enabled(c->wifi_enable);
     } else {
         ESP_LOGI(TAG, "WiFi credentials changed -> will apply after reboot");
+    }
+
+    /* ---- Display Runtime ---- */
+    if (c->display_enable) {
+        mr_display_power(true);
+        mr_display_init();
+        mr_display_sleep(false);
+    } else {
+        mr_display_sleep(true);
+        mr_display_power(false);
     }
 
     /* Snapshot nur für wifi_enable */
@@ -456,6 +473,12 @@ bool mr_cfg_set_kv(mr_cfg_t *c, const char *key, const char *val)
 
     if (strcmp(key, "bme280") == 0) {
         c->bme280_enable = (atoi(val) != 0);
+        return true;
+    }
+
+    if (strcmp(key, "display") == 0) {
+        if (!parse_bool(val, &bv)) return false;
+        c->display_enable = bv;
         return true;
     }
 
@@ -627,6 +650,7 @@ void mr_cfg_to_json(const mr_cfg_t *c, char *out, size_t out_sz)
         "\"tx_dbm\":%d,"
         "\"powersave\":%u,"
         "\"bme280\":%u,"
+        "\"display\":%u,"
         "\"relay_gpio\":%d,"
         "\"sensor_wake_ms\":%lu,"
         "\"sensor_rxwin_ms\":%lu"
@@ -650,6 +674,7 @@ void mr_cfg_to_json(const mr_cfg_t *c, char *out, size_t out_sz)
         (int)c->tx_power_dbm,
         c->powersave_enable ? 1 : 0,
         c->bme280_enable ? 1 : 0,
+        c->display_enable ? 1 : 0,
         (int)c->relay_gpio,
         (unsigned long)c->sensor_wake_period_ms,
         (unsigned long)c->sensor_boot_rx_window_ms

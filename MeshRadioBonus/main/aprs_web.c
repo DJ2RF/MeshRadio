@@ -28,6 +28,9 @@ static void cfg_defaults(aprs_web_cfg_t *c)
     snprintf(c->host, sizeof(c->host), "%s", APRS_IS_HOST);
     c->port = APRS_IS_PORT;
     c->interval_ms = 60000;
+    c->use_static_pos = false;
+    c->latitude[0] = 0;
+    c->longitude[0] = 0;
 }
 
 static void trim_inplace(char *s)
@@ -159,11 +162,14 @@ static esp_err_t save_cfg(void)
     err |= nvs_set_str(nvs, "host", g_aprs.host);
     err |= nvs_set_u16(nvs, "port", g_aprs.port);
     err |= nvs_set_u32(nvs, "interval", g_aprs.interval_ms);
+    err |= nvs_set_u8(nvs, "usepos", g_aprs.use_static_pos ? 1 : 0);
+    err |= nvs_set_str(nvs, "lat", g_aprs.latitude);
+    err |= nvs_set_str(nvs, "lon", g_aprs.longitude);
     if(err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
 
     ESP_LOGI(TAG,
-         "SAVE APRS: enabled=%u call='%s' pass='%s' host='%s' port=%u interval_ms=%lu sym=%c%c comment='%s'",
+         "SAVE APRS: enabled=%u call='%s' pass='%s' host='%s' port=%u interval_ms=%lu sym=%c%c static=%u lat='%s' lon='%s' comment='%s'",
          g_aprs.enabled ? 1 : 0,
          g_aprs.callsign,
          g_aprs.passcode,
@@ -172,6 +178,9 @@ static esp_err_t save_cfg(void)
          (unsigned long)g_aprs.interval_ms,
          g_aprs.symbol_table,
          g_aprs.symbol_code,
+         g_aprs.use_static_pos ? 1 : 0,
+         g_aprs.latitude,
+         g_aprs.longitude,
          g_aprs.comment);
     return err;
 }
@@ -198,6 +207,9 @@ static void load_cfg(void)
     load_str_or_default(nvs, "host", g_aprs.host, sizeof(g_aprs.host), APRS_IS_HOST);
     if(nvs_get_u16(nvs, "port", &u16) == ESP_OK && u16 > 0) g_aprs.port = u16;
     if(nvs_get_u32(nvs, "interval", &u32) == ESP_OK && u32 >= 5000UL) g_aprs.interval_ms = u32;
+    if(nvs_get_u8(nvs, "usepos", &u8) == ESP_OK) g_aprs.use_static_pos = (u8 != 0);
+    load_str_or_default(nvs, "lat", g_aprs.latitude, sizeof(g_aprs.latitude), "");
+    load_str_or_default(nvs, "lon", g_aprs.longitude, sizeof(g_aprs.longitude), "");
 
     nvs_close(nvs);
 }
@@ -213,7 +225,7 @@ static const char *PAGE_HTML =
 ".muted{color:#666}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:760px){.row{grid-template-columns:1fr}}"
 "</style></head><body>"
 "<h2>APRS Konfiguration</h2>"
-"<div class='card'><div class='muted'>Nur auf GPS-Devices sichtbar.</div>"
+"<div class='card'><div class='muted'>Gateway-Position kann statisch ohne GPS gesetzt werden.</div>"
 "<label><input id='enabled' type='checkbox' style='width:auto'> APRS aktiviert</label>"
 "<label>Rufzeichen</label><input id='callsign'>"
 "<label>Passwort / Passcode</label><input id='passcode'>"
@@ -222,27 +234,28 @@ static const char *PAGE_HTML =
 "<label>APRS-IS Host</label><input id='host'>"
 "<label>Port</label><input id='port'>"
 "<label>Sendeintervall (ms)</label><input id='interval'>"
+"<label><input id='use_static_pos' type='checkbox' style='width:auto'> Statische Gateway-Position senden</label>"
+"<div class='row'><div><label>Latitude (dezimal)</label><input id='latitude' placeholder='49.0583'></div><div><label>Longitude (dezimal)</label><input id='longitude' placeholder='11.0633'></div></div>"
 "<div><button onclick='loadCfg()'>Laden</button><button onclick='saveCfg()'>Speichern</button><button onclick=\"location.href='/'\">Zurück</button></div>"
 "<div id='msg' class='muted'></div></div>"
 "<script>"
 "async function post(u,b){let r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});return await r.text();}"
-"async function loadCfg(){try{let j=JSON.parse(await (await fetch('/api/aprs/get')).text());document.getElementById('enabled').checked=!!j.enabled;document.getElementById('callsign').value=j.callsign||'';document.getElementById('passcode').value=j.passcode||'';document.getElementById('symbol_table').value=j.symbol_table||'/';document.getElementById('symbol_code').value=j.symbol_code||'>';document.getElementById('comment').value=j.comment||'';document.getElementById('host').value=j.host||'';document.getElementById('port').value=j.port||14580;document.getElementById('interval').value=j.interval_ms||60000;document.getElementById('msg').textContent='Konfiguration geladen';}catch(e){document.getElementById('msg').textContent='Ladefehler: '+e;}}"
-"async function saveCfg(){let body='enabled='+(document.getElementById('enabled').checked?'1':'0')+'&callsign='+encodeURIComponent(document.getElementById('callsign').value)+'&passcode='+encodeURIComponent(document.getElementById('passcode').value)+'&symbol_table='+encodeURIComponent(document.getElementById('symbol_table').value)+'&symbol_code='+encodeURIComponent(document.getElementById('symbol_code').value)+'&comment='+encodeURIComponent(document.getElementById('comment').value)+'&host='+encodeURIComponent(document.getElementById('host').value)+'&port='+encodeURIComponent(document.getElementById('port').value)+'&interval='+encodeURIComponent(document.getElementById('interval').value);document.getElementById('msg').textContent=await post('/api/aprs/set',body);}"
+"async function loadCfg(){try{let j=JSON.parse(await (await fetch('/api/aprs/get')).text());document.getElementById('enabled').checked=!!j.enabled;document.getElementById('callsign').value=j.callsign||'';document.getElementById('passcode').value=j.passcode||'';document.getElementById('symbol_table').value=j.symbol_table||'/';document.getElementById('symbol_code').value=j.symbol_code||'>';document.getElementById('comment').value=j.comment||'';document.getElementById('host').value=j.host||'';document.getElementById('port').value=j.port||14580;document.getElementById('interval').value=j.interval_ms||60000;document.getElementById('use_static_pos').checked=!!j.use_static_pos;document.getElementById('latitude').value=j.latitude||'';document.getElementById('longitude').value=j.longitude||'';document.getElementById('msg').textContent='Konfiguration geladen';}catch(e){document.getElementById('msg').textContent='Ladefehler: '+e;}}"
+"async function saveCfg(){let body='enabled='+(document.getElementById('enabled').checked?'1':'0')+'&callsign='+encodeURIComponent(document.getElementById('callsign').value)+'&passcode='+encodeURIComponent(document.getElementById('passcode').value)+'&symbol_table='+encodeURIComponent(document.getElementById('symbol_table').value)+'&symbol_code='+encodeURIComponent(document.getElementById('symbol_code').value)+'&comment='+encodeURIComponent(document.getElementById('comment').value)+'&host='+encodeURIComponent(document.getElementById('host').value)+'&port='+encodeURIComponent(document.getElementById('port').value)+'&interval='+encodeURIComponent(document.getElementById('interval').value)+'&use_static_pos='+(document.getElementById('use_static_pos').checked?'1':'0')+'&latitude='+encodeURIComponent(document.getElementById('latitude').value)+'&longitude='+encodeURIComponent(document.getElementById('longitude').value);document.getElementById('msg').textContent=await post('/api/aprs/set',body);}"
 "loadCfg();"
 "</script></body></html>";
 
 static esp_err_t page_get(httpd_req_t *req)
 {
-    if(!aprs_web_has_gps_board()) return send_text(req, "APRS config only available on GPS boards");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, PAGE_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t api_get(httpd_req_t *req)
 {
-    char out[512];
+    char out[768];
     snprintf(out, sizeof(out),
-             "{\"enabled\":%s,\"callsign\":\"%s\",\"passcode\":\"%s\",\"symbol_table\":\"%c\",\"symbol_code\":\"%c\",\"comment\":\"%s\",\"host\":\"%s\",\"port\":%u,\"interval_ms\":%lu}",
+             "{\"enabled\":%s,\"callsign\":\"%s\",\"passcode\":\"%s\",\"symbol_table\":\"%c\",\"symbol_code\":\"%c\",\"comment\":\"%s\",\"host\":\"%s\",\"port\":%u,\"interval_ms\":%lu,\"use_static_pos\":%s,\"latitude\":\"%s\",\"longitude\":\"%s\"}",
              g_aprs.enabled ? "true" : "false",
              g_aprs.callsign,
              g_aprs.passcode,
@@ -251,14 +264,17 @@ static esp_err_t api_get(httpd_req_t *req)
              g_aprs.comment,
              g_aprs.host,
              (unsigned)g_aprs.port,
-             (unsigned long)g_aprs.interval_ms);
+             (unsigned long)g_aprs.interval_ms,
+             g_aprs.use_static_pos ? "true" : "false",
+             g_aprs.latitude,
+             g_aprs.longitude);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t api_set(httpd_req_t *req)
 {
-    char body[512];
+    char body[768];
     char tmp[128];
     if(!read_body(req, body, sizeof(body))) return send_text(req, "ERR body");
     ESP_LOGI(TAG, "POST BODY: %s", body);
@@ -300,6 +316,18 @@ static esp_err_t api_set(httpd_req_t *req)
         }
     }
 
+    if(form_get(body, "use_static_pos", tmp, sizeof(tmp))) g_aprs.use_static_pos = (tmp[0] == '1');
+
+    if(form_get(body, "latitude", tmp, sizeof(tmp))){
+        trim_inplace(tmp);
+        strlcpy(g_aprs.latitude, tmp, sizeof(g_aprs.latitude));
+    }
+
+    if(form_get(body, "longitude", tmp, sizeof(tmp))){
+        trim_inplace(tmp);
+        strlcpy(g_aprs.longitude, tmp, sizeof(g_aprs.longitude));
+    }
+
     if(g_aprs.callsign[0] == 0) snprintf(g_aprs.callsign, sizeof(g_aprs.callsign), "%s", APRS_CALLSIGN);
     if(g_aprs.passcode[0] == 0) snprintf(g_aprs.passcode, sizeof(g_aprs.passcode), "%s", APRS_PASSCODE);
     if(g_aprs.host[0] == 0) snprintf(g_aprs.host, sizeof(g_aprs.host), "%s", APRS_IS_HOST);
@@ -320,12 +348,15 @@ void aprs_web_init(void)
 {
     load_cfg();
     g_init = true;
-    ESP_LOGI(TAG, "APRS cfg init: enabled=%u call=%s host=%s port=%u interval_ms=%lu",
+    ESP_LOGI(TAG, "APRS cfg init: enabled=%u call=%s host=%s port=%u interval_ms=%lu static=%u lat=%s lon=%s",
              g_aprs.enabled ? 1 : 0,
              g_aprs.callsign,
              g_aprs.host,
              (unsigned)g_aprs.port,
-             (unsigned long)g_aprs.interval_ms);
+             (unsigned long)g_aprs.interval_ms,
+             g_aprs.use_static_pos ? 1 : 0,
+             g_aprs.latitude,
+             g_aprs.longitude);
 }
 
 void aprs_web_register_http(httpd_handle_t server)
@@ -397,6 +428,24 @@ uint32_t aprs_web_interval_ms(void)
 {
     if(!g_init) aprs_web_init();
     return g_aprs.interval_ms;
+}
+
+bool aprs_web_use_static_pos(void)
+{
+    if(!g_init) aprs_web_init();
+    return g_aprs.use_static_pos;
+}
+
+const char *aprs_web_latitude(void)
+{
+    if(!g_init) aprs_web_init();
+    return g_aprs.latitude;
+}
+
+const char *aprs_web_longitude(void)
+{
+    if(!g_init) aprs_web_init();
+    return g_aprs.longitude;
 }
 
 void aprs_web_get_cfg(aprs_web_cfg_t *out)

@@ -58,18 +58,15 @@ import tkinter as tk
 from tkinter import ttk
 
 
-VERSION = "MRVIS v2.0 (c) nerdverlag.com"
+VERSION = "MRVIS v2.1 (c) nerdverlag.com"
 HELP_URL = "https://nerdverlag.com/?page_id=719"
 
 # ---------------------------------------------------------------------
 # Regex / Parser
 # ---------------------------------------------------------------------
 
-# AWAKE must trigger in all cases, with or without WX payload
 AWAKE_RE = re.compile(r"\bSENSOR:AWAKE\b", re.IGNORECASE)
 
-# Robust WX parser:
-# Allows extra fields before/between values as long as the expected fields exist.
 WX_RE = re.compile(
     r"SENSOR:AWAKE.*?WX.*?"
     r"t=(?P<t>-?\d+(?:\.\d+)?)C.*?"
@@ -80,11 +77,7 @@ WX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# RSSI can appear anywhere in the line
 RSSI_RE = re.compile(r"\b(?:RSSI|rssi)\s*[:=]\s*(?P<rssi>-?\d+)\b")
-
-# Sender node/callsign for node list
-# "-" is explicitly allowed so names like DJ2RF-01 are not truncated.
 FROM_RE = re.compile(r"\bfrom\s*[:=]\s*(?P<call>[A-Za-z0-9/_-]+)")
 
 
@@ -93,14 +86,52 @@ FROM_RE = re.compile(r"\bfrom\s*[:=]\s*(?P<call>[A-Za-z0-9/_-]+)")
 # ---------------------------------------------------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM16")
-    ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--timeout", type=float, default=0.2)
-    ap.add_argument("--window", type=int, default=30)
-    ap.add_argument("--dst", default="DL1ABCF-1")
-    ap.add_argument("--max-points", type=int, default=300)
-    ap.add_argument("--always-allow-tx", action="store_true")
+    ap = argparse.ArgumentParser(
+        prog="meshradio_console.py",
+        description="MeshRadio Console GUI for live monitoring and control of MeshRadio nodes.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    ap.add_argument(
+        "--port",
+        default="COM16",
+        help="Serial port of the MeshRadio device",
+    )
+    ap.add_argument(
+        "--baud",
+        type=int,
+        default=115200,
+        help="Serial baud rate",
+    )
+    ap.add_argument(
+        "--timeout",
+        type=float,
+        default=0.2,
+        help="Serial read timeout in seconds",
+    )
+    ap.add_argument(
+        "--window",
+        type=int,
+        default=30,
+        help="TX window duration in seconds after AWAKE",
+    )
+    ap.add_argument(
+        "--dst",
+        default="DL1ABCF-1",
+        help="Default destination callsign/node ID",
+    )
+    ap.add_argument(
+        "--max-points",
+        type=int,
+        default=300,
+        help="Maximum number of plot history samples",
+    )
+    ap.add_argument(
+        "--always-allow-tx",
+        action="store_true",
+        help="Allow TX even when TX window is closed",
+    )
+
     return ap.parse_args()
 
 
@@ -126,14 +157,13 @@ class Shared:
 
         self.auto_armed = False
         self.auto_payload = ""
+        self.auto_dst = ""
 
         self.auto_last_sent_ts = None
         self.auto_last_sent_payload = ""
 
-        # Last known RSSI
         self.last_rssi = None
 
-        # Node table:
         # call -> {"last_seen": datetime, "rssi": int|None, "last_line": str}
         self.nodes = {}
 
@@ -192,12 +222,6 @@ def tx_window_ok(window_s: int) -> tuple[bool, int]:
 
 
 def rssi_to_quality(rssi: int | None) -> tuple[int | None, str]:
-    """
-    Map RSSI roughly to a 0..100% link quality.
-
-    -120 dBm -> 0%
-    -30 dBm  -> 100%
-    """
     if rssi is None:
         return None, "—"
 
@@ -250,17 +274,12 @@ def serial_reader(args):
         if not line:
             continue
 
-        # Debugging if needed:
-        # print(f"[RX] {line}")
-
         awake = AWAKE_RE.search(line)
         wxm = WX_RE.search(line)
 
-        # Ignore unrelated lines
         if not awake and not wxm:
             continue
 
-        # Optional RSSI
         rssi = None
         rm = RSSI_RE.search(line)
         if rm:
@@ -269,7 +288,6 @@ def serial_reader(args):
             except Exception:
                 rssi = None
 
-        # Optional node/callsign
         call = None
         fm = FROM_RE.search(line)
         if fm:
@@ -279,17 +297,15 @@ def serial_reader(args):
 
         do_auto = False
         auto_payload = ""
+        auto_dst = ""
 
         with S.lock:
-            # Every AWAKE opens the TX window
             if awake:
                 S.last_awake_ts = ts
 
-            # Update last known RSSI if present
             if rssi is not None:
                 S.last_rssi = rssi
 
-            # Update node list even for bare AWAKE lines
             if call:
                 ent = S.nodes.get(call)
                 if ent is None:
@@ -301,7 +317,6 @@ def serial_reader(args):
                     ent["rssi"] = rssi
                 ent["last_line"] = line
 
-            # Store a full WX sample if available
             if wxm:
                 t_c = float(wxm.group("t"))
                 p_hpa = int(wxm.group("p"))
@@ -309,28 +324,27 @@ def serial_reader(args):
                 mv = int(wxm.group("bat_mv"))
                 pct = int(wxm.group("bat_pct"))
 
-                # For history keep RSSI from this line if present,
-                # otherwise the last known RSSI.
                 hist_rssi = rssi if rssi is not None else S.last_rssi
                 lq, _ = rssi_to_quality(hist_rssi)
 
                 S.last_sample = (ts, t_c, p_hpa, rh, mv, pct, hist_rssi, lq, line)
                 S.samples.append((ts, t_c, p_hpa, rh, mv, pct, hist_rssi, lq))
 
-            # Auto command fires on ANY AWAKE
             if awake and S.auto_armed and S.auto_payload.strip():
                 do_auto = True
                 auto_payload = S.auto_payload.strip()
+                auto_dst = (S.auto_dst or args.dst).strip() or args.dst
                 S.auto_armed = False
                 S.auto_payload = ""
+                S.auto_dst = ""
 
         if do_auto:
-            full = make_send_cmd(args.dst, 1, auto_payload)
+            full = make_send_cmd(auto_dst, 1, auto_payload)
             ok = send_cli_line(full)
             if ok:
                 with S.lock:
                     S.auto_last_sent_ts = dt.datetime.now()
-                    S.auto_last_sent_payload = auto_payload
+                    S.auto_last_sent_payload = f"{auto_dst} | {auto_payload}"
 
     try:
         ser.close()
@@ -339,16 +353,10 @@ def serial_reader(args):
 
 
 # ---------------------------------------------------------------------
-# Plot window (embedded Matplotlib inside Tk Toplevel)
+# Plot window
 # ---------------------------------------------------------------------
 
 def start_plot_window(root):
-    """
-    Create a normal Tk child window for plots.
-
-    This avoids the common behavior of a separate Matplotlib top-level
-    window jumping to the foreground on some systems.
-    """
     global S
     assert S is not None
 
@@ -356,7 +364,6 @@ def start_plot_window(root):
     win.title(f"MeshRadio WX Plot — {VERSION}")
     win.geometry("1500x900")
 
-    # Explicitly do NOT force topmost
     try:
         win.attributes("-topmost", False)
     except Exception:
@@ -365,17 +372,14 @@ def start_plot_window(root):
     fig = Figure(figsize=(15, 9), dpi=100)
     gs = fig.add_gridspec(3, 3)
 
-    # First row: Temp | Pressure | Humidity
     ax_t = fig.add_subplot(gs[0, 0])
     ax_p = fig.add_subplot(gs[0, 1])
     ax_rh = fig.add_subplot(gs[0, 2])
 
-    # Second row: Batt mV | Batt %
     ax_mv = fig.add_subplot(gs[1, 0])
     ax_pct = fig.add_subplot(gs[1, 1])
     ax_empty_1 = fig.add_subplot(gs[1, 2])
 
-    # Third row: RSSI | Link Quality
     ax_rssi = fig.add_subplot(gs[2, 0])
     ax_lq = fig.add_subplot(gs[2, 1])
     ax_empty_2 = fig.add_subplot(gs[2, 2])
@@ -419,7 +423,6 @@ def start_plot_window(root):
     canvas_widget = canvas.get_tk_widget()
     canvas_widget.pack(fill="both", expand=True)
 
-    # Allows plot window to be closed independently
     closed = {"value": False}
 
     def on_close():
@@ -475,7 +478,6 @@ def start_plot_window(root):
                 ax.relim()
                 ax.autoscale_view()
 
-            # Fixed logical limits
             ax_pct.set_ylim(0, 100)
             ax_lq.set_ylim(0, 100)
 
@@ -503,7 +505,7 @@ def start_plot_window(root):
 
 
 # ---------------------------------------------------------------------
-# Control window (main Tk root)
+# Control window
 # ---------------------------------------------------------------------
 
 def start_control_window(args, root):
@@ -512,7 +514,6 @@ def start_control_window(args, root):
 
     root.title(f"MeshRadio Control Panel — {VERSION}")
 
-    # ---------------- Top: TX window indicator ----------------
     frmTop = ttk.Frame(root, padding=10)
     frmTop.grid(row=0, column=0, sticky="ew")
 
@@ -526,7 +527,6 @@ def start_control_window(args, root):
     lblCnt = ttk.Label(frmTop, text="—", font=("Segoe UI", 12, "bold"))
     lblCnt.grid(row=1, column=1, sticky="w")
 
-    # ---------------- Manual send area ----------------
     frmMid = ttk.Frame(root, padding=10)
     frmMid.grid(row=1, column=0, sticky="ew")
 
@@ -543,11 +543,9 @@ def start_control_window(args, root):
     )
     frmMid.columnconfigure(3, weight=1)
 
-    # ---------------- Quick buttons ----------------
     frmBot = ttk.Frame(root, padding=10)
     frmBot.grid(row=2, column=0, sticky="ew")
 
-    # ---------------- Auto one-shot ----------------
     frmAuto = ttk.LabelFrame(
         root, text="One-shot Auto Command (sent ONCE on next AWAKE)", padding=10
     )
@@ -619,7 +617,6 @@ def start_control_window(args, root):
         b.grid(row=0, column=i, sticky="ew", padx=5)
         frmBot.columnconfigure(i, weight=1)
 
-    # Auto commands as selectable dropdown
     AUTO_COMMANDS = [
         "CMD:RELAY ON",
         "CMD:RELAY OFF",
@@ -647,7 +644,6 @@ def start_control_window(args, root):
     lblLog = ttk.Label(frmAuto, text="log: (none)")
     lblLog.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
-    # ---------------- Link summary ----------------
     frmLink = ttk.Frame(root, padding=10)
     frmLink.grid(row=4, column=0, sticky="ew")
 
@@ -656,7 +652,6 @@ def start_control_window(args, root):
     lblLink.grid(row=0, column=1, sticky="w", padx=(6, 0))
     frmLink.columnconfigure(1, weight=1)
 
-    # ---------------- Node table ----------------
     frmNodes = ttk.LabelFrame(root, text="Nodes (last seen)", padding=10)
     frmNodes.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
     root.grid_rowconfigure(5, weight=1)
@@ -689,22 +684,34 @@ def start_control_window(args, root):
         lblAutoState.config(text="DISARMED", bg="#aa3333")
         sent_until["ts"] = None
 
-    def ui_set_armed():
-        lblAutoState.config(text="ARMED (waiting AWAKE)", bg="#228822")
+    def ui_set_armed(dst: str, payload: str):
+        short_dst = dst.strip()
+        short_payload = payload.strip()
+
+        if len(short_dst) > 12:
+            short_dst = short_dst[:12] + "…"
+        if len(short_payload) > 14:
+            short_payload = short_payload[:14] + "…"
+
+        lblAutoState.config(
+            text=f"ARMED {short_dst} ← {short_payload}",
+            bg="#228822"
+        )
         sent_until["ts"] = None
 
-    def ui_set_sent(payload: str):
-        short = payload.strip()
-        if len(short) > 18:
-            short = short[:18] + "…"
+    def ui_set_sent(info: str):
+        short = info.strip()
+        if len(short) > 22:
+            short = short[:22] + "…"
         lblAutoState.config(text=f"SENT ✓ ({short})", bg="#caa200")
         sent_until["ts"] = dt.datetime.now() + dt.timedelta(seconds=3)
 
     def arm_auto():
         selected = varAuto.get().strip()
+        current_dst = varDst.get().strip() or args.dst
 
-        lblLog.config(text=f"log: ARM clicked, selected='{selected}'")
-        print(f"[UI] ARM click, selected='{selected}'")
+        lblLog.config(text=f"log: ARM clicked, dst='{current_dst}', selected='{selected}'")
+        print(f"[UI] ARM click, dst='{current_dst}', selected='{selected}'")
 
         if not selected:
             lblDbg.config(text="debug: auto_armed=0 (no cmd)")
@@ -713,13 +720,14 @@ def start_control_window(args, root):
 
         with S.lock:
             S.auto_payload = selected
+            S.auto_dst = current_dst
             S.auto_armed = True
             S.auto_last_sent_ts = None
             S.auto_last_sent_payload = ""
 
-        ui_set_armed()
-        lblDbg.config(text="debug: auto_armed=1 (ARM OK)")
-        set_status(f"ARMED: will send once on next AWAKE → '{selected}'", ok=True)
+        ui_set_armed(current_dst, selected)
+        lblDbg.config(text=f"debug: auto_armed=1 dst='{current_dst}'")
+        set_status(f"ARMED: next AWAKE sends to {current_dst} → '{selected}'", ok=True)
 
     def disarm_auto():
         lblLog.config(text="log: DISARM clicked")
@@ -727,6 +735,7 @@ def start_control_window(args, root):
 
         with S.lock:
             S.auto_payload = ""
+            S.auto_dst = ""
             S.auto_armed = False
 
         ui_set_disarmed()
@@ -790,6 +799,8 @@ def start_control_window(args, root):
 
         with S.lock:
             armed = S.auto_armed
+            auto_dst = S.auto_dst
+            auto_payload = S.auto_payload
             sent_ts = S.auto_last_sent_ts
             sent_pl = S.auto_last_sent_payload
             lrssi = S.last_rssi
@@ -821,7 +832,7 @@ def start_control_window(args, root):
 
         if sent_until["ts"] is None:
             if armed:
-                lblAutoState.config(text="ARMED (waiting AWAKE)", bg="#228822")
+                ui_set_armed(auto_dst or args.dst, auto_payload or "")
             else:
                 lblAutoState.config(text="DISARMED", bg="#aa3333")
 
@@ -849,14 +860,11 @@ def main():
 
     root = tk.Tk()
 
-    # Start serial thread
     th = threading.Thread(target=serial_reader, args=(args,), daemon=True)
     th.start()
 
-    # Create main control window on root
     start_control_window(args, root)
 
-    # Create plot window as normal child window
     plot_win, plot_update = start_plot_window(root)
 
     def plot_tick():

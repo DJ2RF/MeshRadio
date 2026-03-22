@@ -77,6 +77,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 
 #include "nvs_flash.h"
@@ -245,8 +246,14 @@ bool g_bc_fallback=true;
 bool g_beacon_enabled=true;
 bool g_routeadv_enable=DEFAULT_ROUTEADV_ENABLE;
 bool g_cad_enable=DEFAULT_CAD_ENABLE;
+bool g_display_enabled = true;
 bool g_powersave_enable = false;
 bool g_bme280_enable = false;
+
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+static void prog_button_init(void);
+static void prog_button_poll(void);
+#endif
 
 node_mode_t g_node_mode = (node_mode_t)DEFAULT_NODE_MODE;
 
@@ -300,6 +307,12 @@ static bool g_adc_cali_ok=false;
 static uint32_t g_batt_mv=0;
 static uint32_t g_batt_pct=0;
 static uint32_t g_next_batt_ms=0;
+#endif
+
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+    (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+static void pwr_button_init(void);
+static void pwr_button_poll(void);
 #endif
 
 // ============================================================================
@@ -472,6 +485,57 @@ static void json_escape_into(char *dst, size_t dst_sz, const char *src)
     dst[o]=0;
 }
 
+
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+static void prog_button_init(void)
+{
+    gpio_config_t io = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << 0), // GPIO0 = PROG button
+        .pull_down_en = 0,
+        .pull_up_en = 1,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+}
+
+static void prog_button_poll(void)
+{
+    static int last = 1;
+    static uint32_t last_ms = 0;
+
+    const int level = gpio_get_level((gpio_num_t)0);
+    const uint32_t t = now_ms();
+
+    if (level != last) {
+        if ((t - last_ms) < 30) return; // debounce
+        last_ms = t;
+
+        if (last == 1 && level == 0) {
+            g_display_enabled = !g_display_enabled;
+
+            if (g_display_enabled) {
+                mr_display_init();
+                mr_display_sleep(false);
+                mr_display_show_status(
+                    "DISPLAY ON",
+                    cfg_board_str(),
+                    cfg_lora_chip_str(),
+                    g_callsign_rt
+                );
+                ESP_LOGI(TAG, "PROG button: display ON");
+            } else {
+                mr_display_sleep(true);
+                //mr_display_power(false);
+                ESP_LOGI(TAG, "PROG button: display OFF");
+            }
+        }
+
+        last = level;
+    }
+}
+#endif
+
 #if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
 static void heltec_vext_on(void)
 {
@@ -510,6 +574,7 @@ static void board_power_boot_init(void)
 
 }
 
+
 static inline void batt_path_enable(bool en)
 {
 #if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
@@ -523,6 +588,57 @@ static inline void batt_path_enable(bool en)
 #endif
 }
 
+#endif
+
+#if ((MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+     (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101))
+
+static void pwr_button_init(void)
+{
+    gpio_config_t io = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << PIN_PWR_BUTTON),
+        .pull_down_en = 0,
+        .pull_up_en = 1,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+}
+
+static void pwr_button_poll(void)
+{
+    static int last_level = 1;
+    static uint32_t last_change_ms = 0;
+
+    const int level = gpio_get_level((gpio_num_t)PIN_PWR_BUTTON);
+    const uint32_t tnow = now_ms();
+
+    if (level != last_level) {
+        if ((tnow - last_change_ms) < 30) return;
+        last_change_ms = tnow;
+
+        if (last_level == 1 && level == 0) {
+            g_display_enabled = !g_display_enabled;
+
+            if (g_display_enabled) {
+                //mr_display_power(true);
+                mr_display_init();
+                mr_display_sleep(false);
+                ESP_LOGI(TAG, "PWR button: display ON");
+                mr_display_show_status("DISPLAY ON",
+                           cfg_board_str(),
+                           cfg_lora_chip_str(),
+                           g_callsign_rt);
+            } else {
+                mr_display_sleep(true);
+                //mr_display_power(false);
+                ESP_LOGI(TAG, "PWR button: display OFF");
+            }
+        }
+
+        last_level = level;
+    }
+}
 #endif
 
 // ============================================================================
@@ -1841,11 +1957,11 @@ static void batt_poll(void)
         );
     }
 
-    ESP_LOGI("BATT", "ADC: raw=%d mv_adc=%d vbat=%lu => %lu%%",
+    /*ESP_LOGI("BATT", "ADC: raw=%d mv_adc=%d vbat=%lu => %lu%%",
              raw,
              mv_adc,
              (unsigned long)g_batt_mv,
-             (unsigned long)g_batt_pct);
+             (unsigned long)g_batt_pct);*/
 #endif
 }
 
@@ -2108,6 +2224,9 @@ static void aprs_cfg_from_local_web(aprs_cfg_t *out)
     snprintf(out->comment, sizeof(out->comment), "%s", aprs_web_comment());
     snprintf(out->host, sizeof(out->host), "%s", aprs_web_host());
     out->port = aprs_web_port();
+    out->use_static_pos = aprs_web_use_static_pos();
+    snprintf(out->latitude, sizeof(out->latitude), "%s", aprs_web_latitude());
+    snprintf(out->longitude, sizeof(out->longitude), "%s", aprs_web_longitude());
 }
 
 static void aprs_format_lat_for_body(double lat, char *out, size_t out_sz, char *out_hemi)
@@ -2144,6 +2263,57 @@ static bool aprs_build_body_from_gps_text(const char *gps_txt,
     if(lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0){
         return false;
     }
+
+    char aprs_lat[16];
+    char aprs_lon[16];
+    char lat_hemi = 'N';
+    char lon_hemi = 'E';
+
+    aprs_format_lat_for_body(lat, aprs_lat, sizeof(aprs_lat), &lat_hemi);
+    aprs_format_lon_for_body(lon, aprs_lon, sizeof(aprs_lon), &lon_hemi);
+
+    char symbol_table = cfg->symbol_table ? cfg->symbol_table : '/';
+    char symbol_code  = cfg->symbol_code  ? cfg->symbol_code  : '>';
+
+    int n = snprintf(out_body, out_body_sz,
+                     "!%.7s%c%c%.8s%c%c%s",
+                     aprs_lat, lat_hemi,
+                     symbol_table,
+                     aprs_lon, lon_hemi,
+                     symbol_code,
+                     cfg->comment);
+    return (n > 0 && (size_t)n < out_body_sz);
+}
+
+static bool aprs_parse_decimal_coord(const char *s, double min_v, double max_v, double *out)
+{
+    if(!s || !*s || !out) return false;
+
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if(end == s) return false;
+
+    while(end && *end){
+        if(!isspace((unsigned char)*end)) return false;
+        end++;
+    }
+
+    if(v < min_v || v > max_v) return false;
+    *out = v;
+    return true;
+}
+
+static bool aprs_build_body_from_static_cfg(const aprs_cfg_t *cfg,
+                                            char *out_body,
+                                            size_t out_body_sz)
+{
+    if(!cfg || !out_body || out_body_sz < 32) return false;
+    if(!cfg->use_static_pos) return false;
+
+    double lat = 0.0;
+    double lon = 0.0;
+    if(!aprs_parse_decimal_coord(cfg->latitude, -90.0, 90.0, &lat)) return false;
+    if(!aprs_parse_decimal_coord(cfg->longitude, -180.0, 180.0, &lon)) return false;
 
     char aprs_lat[16];
     char aprs_lon[16];
@@ -2519,6 +2689,24 @@ static const char *INDEX_HTML =
 "  <label>Ziel (dst)</label><input id='dst'>"
 "  <label>ACK (0/1)</label><input id='ack' value='1'>"
 "  <label>Text</label><input id='msg' value='CMD:STATUS?'>"
+"  <label>Quick Command</label>"
+"  <select id='cmdsel' onchange='applyCmdPreset()'>"
+"    <option value=''>-- Select Command --</option>"
+"    <option value='CMD:STATUS?'>STATUS</option>"
+"    <option value='CMD:DISPLAY ON'>DISPLAY ON</option>"
+"    <option value='CMD:DISPLAY OFF'>DISPLAY OFF</option>"
+"    <option value='CMD:WIFI ON'>WIFI ON</option>"
+"    <option value='CMD:WIFI OFF'>WIFI OFF</option>"
+"    <option value='CMD:GPS'>GPS</option>"
+"    <option value='CMD:BATT'>BATT</option>"
+"    <option value='CMD:VERSION'>VERSION</option>"
+"    <option value='CMD:REBOOT'>REBOOT</option>"
+"    <option value='CMD:RELAY ON'>RELAY ON</option>"
+"    <option value='CMD:RELAY OFF'>RELAY OFF</option>"
+"    <option value='CMD:RELAY TOGGLE'>RELAY TOGGLE</option>"
+"    <option value='CMD:CRYPTO ON'>CRYPTO ON</option>"
+"    <option value='CMD:CRYPTO OFF'>CRYPTO OFF</option>"
+"  </select>"
 "  <button onclick='send()'>SEND</button>"
 "  <div id='m' class='muted'></div>"
 " </div>"
@@ -2604,7 +2792,8 @@ static const char *INDEX_HTML =
 "        <label><input type='checkbox' id='cfg_routeadv'><span>RouteAdv enabled</span></label>"
 "        <label><input type='checkbox' id='cfg_cad'><span>CAD enabled</span></label>"
 "        <label><input type='checkbox' id='cfg_powersave'><span>PowerSave enabled</span></label>"
-"        <label><input type='checkbox' id='cfg_bme280'> BME280 enabled</label><br>"
+"        <label><input type='checkbox' id='cfg_bme280'> BME280 enabled</label>"
+"        <label><input type='checkbox' id='cfg_display'><span>Display enabled</span></label><br>"
 "      </div>"
 "      <div class='cfg-actions'>"
 "        <div class='cfg-actions-row'>"
@@ -2665,6 +2854,13 @@ static const char *INDEX_HTML =
 "  }"
 "  h+='</tbody></table>';"
 "  return h;"
+"}"
+
+"function applyCmdPreset(){"
+"  let s=document.getElementById('cmdsel');"
+"  let m=document.getElementById('msg');"
+"  if(!s || !m) return;"
+"  if(s.value) m.value=s.value;"
 "}"
 
 "async function send(){"
@@ -2743,6 +2939,7 @@ static const char *INDEX_HTML =
 "    document.getElementById('cfg_cad').checked=!!c.cad;"
 "    document.getElementById('cfg_powersave').checked=!!c.powersave;"
 "    document.getElementById('cfg_bme280').checked=!!c.bme280;"
+"    document.getElementById('cfg_display').checked=!!c.display;"
 "    cfgSetMsg('Config loaded');"
 "  }catch(e){"
 "    cfgSetMsg('Config load error: '+e);"
@@ -2774,6 +2971,7 @@ static const char *INDEX_HTML =
 "      ['cad', document.getElementById('cfg_cad').checked ? '1' : '0'],"
 "      ['powersave', document.getElementById('cfg_powersave').checked ? '1' : '0'],"
 "      ['bme280', document.getElementById('cfg_bme280').checked ? '1':'0'],"
+"      ['display', document.getElementById('cfg_display').checked ? '1':'0'],"
 "    ];"
 
 "    let pass=document.getElementById('cfg_pass').value;"
@@ -2850,7 +3048,7 @@ static const char *INDEX_HTML =
 "  try{"
 "    let j=JSON.parse(await (await fetch('/api/status')).text());"
 "    document.getElementById('st').textContent='call='+j.call+' • mode='+j.node_mode_str+' • wifi='+j.wifi+' • relay='+j.relay+' • crypto='+j.crypto_enable+' • batt='+j.batt;"
-"    document.getElementById('targetinfo').textContent=(j.board||'?') + ' / ' + (j.chip||'?');"
+"    document.getElementById('targetinfo').textContent=(j.board||'?') + ' / ' + (j.chip||'?') + ' / Firmware: V' + (j.fw||'?') + ' / Protokoll: v' + String(j.proto ?? '?');"
 "    document.getElementById('nm').textContent=j.node_mode_str;"
 "    document.getElementById('cst').textContent=(j.crypto_enable==1)?'ON':'OFF';"
 "    document.getElementById('cst').className=(j.crypto_enable==1)?'ok':'err';"
@@ -2899,7 +3097,7 @@ static esp_err_t index_get(httpd_req_t *req)
     const char *btn = "";
     const mr_board_info_t *b = mr_board_get();
 
-    if(b && b->has_gps){
+    if(b){
         btn = "<div class='card'><h3>APRS</h3><button onclick=\"location.href='/aprs'\">APRS Config</button></div>";
     }
 
@@ -2998,6 +3196,8 @@ static esp_err_t api_status_get(httpd_req_t *req)
         "\"node_mode_str\":\"%s\","
         "\"board\":\"%s\","
         "\"chip\":\"%s\","
+        "\"fw\":\"%s\","
+        "\"proto\":%u,"
         "\"wifi\":%u,"
         "\"relay\":%u,"
         "\"batt\":\"%s\","
@@ -3008,6 +3208,8 @@ static esp_err_t api_status_get(httpd_req_t *req)
         node_mode_str(g_node_mode),
         cfg_board_str(),
         cfg_lora_chip_str(),
+        esp_app_get_description()->version,
+        (unsigned)MR_PROTO_VERSION,
         g_wifi_enabled ? 1 : 0,
 #if MR_RELAY_ENABLE
         g_relay_on ? 1 : 0,
@@ -3298,7 +3500,8 @@ static void sensor_send_awake(void)
 
 static void gps_send_periodic(void)
 {
-#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) ||     (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+    (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
 
     static uint32_t last_gps_send_ms = 0;
     uint32_t tnow = now_ms();
@@ -3351,6 +3554,48 @@ static void gps_send_periodic(void)
     send_data_to(g_relay_callsign_rt, msg, false);
     ESP_LOGI(TAG, "APRSD sent to relay %s: %s", g_relay_callsign_rt, msg);
 #endif
+}
+
+static void aprs_gateway_send_periodic(void)
+{
+    static uint32_t last_gateway_send_ms = 0;
+
+    aprs_cfg_t cfg;
+    aprs_cfg_from_local_web(&cfg);
+
+    if(!cfg.enabled) return;
+    if(!cfg.use_static_pos) return;
+
+    uint32_t interval_ms = aprs_web_interval_ms();
+    if(interval_ms < 5000UL){
+        interval_ms = 60000UL;
+    }
+
+    uint32_t tnow = now_ms();
+    if((tnow - last_gateway_send_ms) < interval_ms){
+        return;
+    }
+
+    char body[80];
+    if(!aprs_build_body_from_static_cfg(&cfg, body, sizeof(body))){
+        ESP_LOGW(TAG, "APRS gateway beacon skipped: invalid static position lat='%s' lon='%s'",
+                 cfg.latitude, cfg.longitude);
+        return;
+    }
+
+    char packet[160];
+    if(!aprs_build_packet_from_cfg(&cfg, body, packet, sizeof(packet))){
+        ESP_LOGW(TAG, "APRS gateway beacon skipped: packet build failed");
+        return;
+    }
+
+    last_gateway_send_ms = tnow;
+
+    if(aprs_send_packet_with_cfg(&cfg, packet)){
+        ESP_LOGI(TAG, "APRS gateway beacon sent: %s", packet);
+    }else{
+        ESP_LOGW(TAG, "APRS gateway beacon send failed");
+    }
 }
 // ============================================================================
 // =============================== HTTP start =================================
@@ -3505,6 +3750,81 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
         mr_cfg_apply(&g_cfg);
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "CRYPTO: OFF");
+        return;
+    }
+
+    if(strcmp(txt, "CMD:DISPLAY ON")==0){
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        g_cfg.display_enable = true;
+        mr_cfg_apply(&g_cfg);
+        xSemaphoreGive(g_mutex);
+        app_send_reply_to_sender(from7, "DISPLAY: ON");
+        return;
+    }
+
+    if(strcmp(txt, "CMD:DISPLAY OFF")==0){
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        g_cfg.display_enable = false;
+        mr_cfg_apply(&g_cfg);
+        xSemaphoreGive(g_mutex);
+        app_send_reply_to_sender(from7, "DISPLAY: OFF");
+        return;
+    }
+
+    if(strcmp(txt, "CMD:WIFI ON")==0){
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        g_cfg.wifi_enable = true;
+        mr_cfg_apply(&g_cfg);
+        xSemaphoreGive(g_mutex);
+        app_send_reply_to_sender(from7, "WIFI: ON");
+        return;
+    }
+
+    if(strcmp(txt, "CMD:WIFI OFF")==0){
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        g_cfg.wifi_enable = false;
+        mr_cfg_apply(&g_cfg);
+        xSemaphoreGive(g_mutex);
+        app_send_reply_to_sender(from7, "WIFI: OFF");
+        return;
+    }
+
+    if(strcmp(txt, "CMD:GPS")==0){
+#if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+    (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
+        char gps_txt[96];
+        mr_gps_get_text(gps_txt, sizeof(gps_txt));
+        app_send_reply_to_sender(from7, gps_txt[0] ? gps_txt : "GPS: N/A");
+#else
+        app_send_reply_to_sender(from7, "GPS: N/A");
+#endif
+        return;
+    }
+
+    if(strcmp(txt, "CMD:BATT")==0){
+        uint32_t batt_mv=0, batt_pct=0;
+#if MR_BATT_ENABLE
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+        batt_mv = g_batt_mv;
+        batt_pct = g_batt_pct;
+        xSemaphoreGive(g_mutex);
+#endif
+        char ans[96];
+        snprintf(ans, sizeof(ans), "BATT: %" PRIu32 "mV/%" PRIu32 "%%", batt_mv, batt_pct);
+        app_send_reply_to_sender(from7, ans);
+        return;
+    }
+
+    if(strcmp(txt, "CMD:VERSION")==0){
+        const esp_app_desc_t *app = esp_app_get_description();
+        app_send_reply_to_sender(from7, app->version);
+        return;
+    }
+
+    if(strcmp(txt, "CMD:REBOOT")==0){
+        app_send_reply_to_sender(from7, "REBOOTING");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
         return;
     }
 
@@ -4083,7 +4403,7 @@ static void cli_print_help(void)
     printf("relay on|off|toggle\n");
 #endif
     printf("send <DST> <ACK 0|1> <TEXT...>\n");
-    printf("cmd  <DST> <ACK 0|1> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF\n");
+    printf("cmd  <DST> <ACK 0|1> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF|DISPLAY ON|DISPLAY OFF|WIFI ON|WIFI OFF|GPS|BATT|VERSION|REBOOT\n");
     printf("---------------------\n\n");
 }
 
@@ -4278,7 +4598,7 @@ static void cli_handle_line(char *line)
         char *ack=strtok_r(NULL, " \t", &save);
         char *what=strtok_r(NULL, " \t", &save);
         if(!dst || !ack || !what){
-            printf("ERR cmd <DST> <ACK> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF\n");
+            printf("ERR cmd <DST> <ACK> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF|DISPLAY ON|DISPLAY OFF|WIFI ON|WIFI OFF|GPS|BATT|VERSION|REBOOT\n");
             return;
         }
         int a=atoi(ack);
@@ -4302,6 +4622,34 @@ static void cli_handle_line(char *line)
             if(streq_ci(arg,"ON")) send_data_to(dst, "CMD:CRYPTO ON", (a!=0));
             else if(streq_ci(arg,"OFF")) send_data_to(dst, "CMD:CRYPTO OFF", (a!=0));
             else { printf("ERR cmd <DST> <ACK> CRYPTO ON|OFF\n"); return; }
+        }
+        else if(streq_ci(what,"DISPLAY")){
+            char *arg=strtok_r(NULL, " \t", &save);
+            if(!arg){ printf("ERR cmd <DST> <ACK> DISPLAY ON|OFF\n"); return; }
+
+            if(streq_ci(arg,"ON")) send_data_to(dst, "CMD:DISPLAY ON", (a!=0));
+            else if(streq_ci(arg,"OFF")) send_data_to(dst, "CMD:DISPLAY OFF", (a!=0));
+            else { printf("ERR cmd <DST> <ACK> DISPLAY ON|OFF\n"); return; }
+        }
+        else if(streq_ci(what,"WIFI")){
+            char *arg=strtok_r(NULL, " \t", &save);
+            if(!arg){ printf("ERR cmd <DST> <ACK> WIFI ON|OFF\n"); return; }
+
+            if(streq_ci(arg,"ON")) send_data_to(dst, "CMD:WIFI ON", (a!=0));
+            else if(streq_ci(arg,"OFF")) send_data_to(dst, "CMD:WIFI OFF", (a!=0));
+            else { printf("ERR cmd <DST> <ACK> WIFI ON|OFF\n"); return; }
+        }
+        else if(streq_ci(what,"GPS")){
+            send_data_to(dst, "CMD:GPS", (a!=0));
+        }
+        else if(streq_ci(what,"BATT")){
+            send_data_to(dst, "CMD:BATT", (a!=0));
+        }
+        else if(streq_ci(what,"VERSION")){
+            send_data_to(dst, "CMD:VERSION", (a!=0));
+        }
+        else if(streq_ci(what,"REBOOT")){
+            send_data_to(dst, "CMD:REBOOT", (a!=0));
         }
         else{
             printf("ERR unknown cmd\n");
@@ -4624,15 +4972,13 @@ void app_main(void)
     gpio_hold_dis((gpio_num_t)VEXT_CTRL_PIN);
 #endif
 
-    mr_display_init();
-    mr_display_show_boot(MR_BOARD_NAME, "DISPLAY OK");
-
     mr_wifi_ota_confirm_running_image();
 
 #if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
     (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
     mr_pmu_init();
     mr_gps_init();
+    pwr_button_init();
 #endif
 
     // ------------------------------------------------------------------------
@@ -4706,6 +5052,16 @@ void app_main(void)
     mr_cfg_apply(&g_cfg);
 
     config_print();
+
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+    prog_button_init();
+#endif
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        mr_display_show_boot(MR_BOARD_NAME, "DISPLAY OK");
+    }
+#endif
 
 // ------------------------------------------------------------------------
 // 4) LoRa init (SPI + Chip)
@@ -4809,10 +5165,14 @@ uint32_t batt_mv = 0, batt_pct = 0;
 #endif
 #endif
 
-mr_display_show_status("MeshRadio",
-                       cfg_board_str(),
-                       cfg_lora_chip_str(),
-                       g_callsign_rt);
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        mr_display_show_status("MeshRadio",
+                               cfg_board_str(),
+                               cfg_lora_chip_str(),
+                               g_callsign_rt);
+    }
+#endif
 
     char wx[160];
     strcpy(wx, "SENSOR:AWAKE");
@@ -4848,7 +5208,7 @@ mr_display_show_status("MeshRadio",
                     batt_mv,
                     batt_pct);
                     #if MR_DISPLAY_ENABLE
-                        {
+                        if(g_display_enabled){
                             
                             char l0[22], l1[22], l2[22], l3[22], l4[22], l5[22], l6[22], l7[22];
 
@@ -4870,17 +5230,18 @@ mr_display_show_status("MeshRadio",
                 snprintf(wx, sizeof(wx), "SENSOR:AWAKE WX ERR");
             
             #if MR_DISPLAY_ENABLE
-                //mr_display_clear();
-                mr_display_show_status8(
-                    "SENSOR AWAKE",
-                    g_callsign_rt,
-                    "WX ERROR",
-                    bme280_is_ok() ? "BME read fail" : "BME init fail",
-                    "",
-                    "Check sensor",
-                    "and I2C bus",
-                    ""
-                );
+                if(g_display_enabled){
+                    mr_display_show_status8(
+                        "SENSOR AWAKE",
+                        g_callsign_rt,
+                        "WX ERROR",
+                        bme280_is_ok() ? "BME read fail" : "BME init fail",
+                        "",
+                        "Check sensor",
+                        "and I2C bus",
+                        ""
+                    );
+                }
             #endif
             }
         }
@@ -4935,6 +5296,7 @@ sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
         mr_gps_poll();
         gps_send_periodic();
 #endif
+        aprs_gateway_send_periodic();
 
 #if (MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
     (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101)
@@ -4967,6 +5329,15 @@ sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
                 );*/
             }
         }
+#endif
+
+       #if ((MR_BOARD_PRESET == MR_BOARD_TBEAM_V11_SX1276) || \
+        (MR_BOARD_PRESET == MR_BOARD_TBEAM_V12_AXP2101))
+        pwr_button_poll();
+        #endif
+
+#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
+        prog_button_poll();
 #endif
 
         if(g_beacon_enabled && g_node_mode != NODE_SENSOR && now_ms() > g_next_beacon_ms){
