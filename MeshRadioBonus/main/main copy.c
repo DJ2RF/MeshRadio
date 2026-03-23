@@ -3052,12 +3052,7 @@ static const char *INDEX_HTML =
 "  document.getElementById('err').textContent='';"
 "  try{"
 "    let j=JSON.parse(await (await fetch('/api/status')).text());"
-"    let cryptoTxt=(j.crypto_enable==1)?'ON':'OFF';"
-"    let dispTxt=(j.display==1)?'ON':'OFF';"
-"    let dispCfgTxt=(j.display_cfg==1)?'ON':'OFF';"
-"    let wifiTxt=(j.wifi==1)?'ON':'OFF';"
-"    let relayTxt=(j.relay==1)?'ON':'OFF';"
-"    document.getElementById('st').textContent='call='+j.call+' • mode='+j.node_mode_str+' • display='+dispTxt+'('+dispCfgTxt+')'+' • wifi='+wifiTxt+' • relay='+relayTxt+' • crypto='+cryptoTxt+' • batt='+j.batt;"
+"    document.getElementById('st').textContent='call='+j.call+' • mode='+j.node_mode_str+' • wifi='+j.wifi+' • relay='+j.relay+' • crypto='+j.crypto_enable+' • batt='+j.batt;"
 "    document.getElementById('targetinfo').textContent=(j.board||'?') + ' / ' + (j.chip||'?') + ' / Firmware: V' + (j.fw||'?') + ' / Protokoll: v' + String(j.proto ?? '?');"
 "    document.getElementById('nm').textContent=j.node_mode_str;"
 "    document.getElementById('cst').textContent=(j.crypto_enable==1)?'ON':'OFF';"
@@ -3727,55 +3722,26 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
 
     if(strcmp(txt, "CMD:STATUS?")==0 || strcmp(txt, "STATUS?")==0){
         uint32_t batt_mv=0, batt_pct=0;
-        int neigh_cnt = 0;
-        int route_cnt = 0;
-        char last_from[9] = "-";
-        bool display_rt = false;
-        bool display_cfg = false;
-        bool wifi_on = false;
-        bool http_on = false;
-        bool crypto_on = false;
-        bool relay_on = false;
-
-        xSemaphoreTake(g_mutex, portMAX_DELAY);
 #if MR_BATT_ENABLE
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
         batt_mv = g_batt_mv;
         batt_pct = g_batt_pct;
-#endif
-        display_rt = g_display_enabled;
-        display_cfg = g_cfg.display_enable;
-        wifi_on = g_wifi_enabled;
-        http_on = g_http_running;
-        crypto_on = g_crypto_enable;
-#if MR_RELAY_ENABLE
-        relay_on = g_relay_on;
-#endif
-        for(int i=0;i<MAX_NEIGHBORS;i++) if(neighbors[i].used) neigh_cnt++;
-        for(int i=0;i<MAX_ROUTES;i++)    if(routes[i].used)    route_cnt++;
-        if(g_last_rx_from[0]){
-            strncpy(last_from, g_last_rx_from, sizeof(last_from)-1);
-            last_from[sizeof(last_from)-1] = 0;
-        }
         xSemaphoreGive(g_mutex);
-
-        char ans[160];
+#endif
+        char ans[240];
         snprintf(ans,sizeof(ans),
-                 "ST:c=%s m=%s r=%s d=%s/%s w=%s h=%s x=%s b=%" PRIu32 "/%" PRIu32 " n=%d rt=%d rx=%s",
-                 g_callsign_rt,
+                 "STATUS: mode=%s relay=%s display=%s wifi=%s http=%s crypto=%s batt=%" PRIu32 "mV/%" PRIu32 "%%",
                  node_mode_str(g_node_mode),
 #if MR_RELAY_ENABLE
-                 relay_on?"ON":"OFF",
+                 g_relay_on?"ON":"OFF",
 #else
                  "N/A",
 #endif
-                 display_rt?"ON":"OFF",
-                 display_cfg?"ON":"OFF",
-                 wifi_on?"ON":"OFF",
-                 http_on?"ON":"OFF",
-                 crypto_on?"ON":"OFF",
-                 batt_mv, batt_pct,
-                 neigh_cnt, route_cnt,
-                 last_from);
+                 g_display_enabled?"ON":"OFF",
+                 g_wifi_enabled?"ON":"OFF",
+                 g_http_running?"ON":"OFF",
+                 g_crypto_enable?"ON":"OFF",
+                 batt_mv, batt_pct);
         app_send_reply_to_sender(from7, ans);
         return;
     }
@@ -4442,54 +4408,24 @@ static void retry_task(void *arg)
 #if MR_CLI_ENABLE
 static void cli_print_help(void)
 {
-    printf("\n--- MeshRadio CLI ---\n\n");
-
-    printf("System\n");
-    printf("------\n");
-    printf("help | h\n");
+    printf("\n--- MeshRadio CLI ---\n");
+    printf("help (h)\n");
     printf("status?\n");
-    printf("version\n");
-    printf("reboot\n\n");
-
-    printf("Radio\n");
-    printf("-----\n");
-    printf("role 0|1|2       (0=RELAY 1=EDGE 2=SENSOR)\n");
     printf("wifi on|off\n");
-    printf("display on|off\n");
-    printf("crypto on|off\n\n");
-
-#if MR_RELAY_ENABLE
-    printf("Relay\n");
-    printf("-----\n");
-    printf("relay on|off|toggle\n\n");
-#endif
-
-    printf("Messaging\n");
-    printf("---------\n");
-    printf("send <DST> <ACK 0|1> <TEXT...>\n\n");
-
-    printf("Remote Commands\n");
-    printf("---------------\n");
-    printf("cmd <DST> <ACK> STATUS\n");
-    printf("cmd <DST> <ACK> RELAY ON|OFF|TOGGLE\n");
-    printf("cmd <DST> <ACK> DISPLAY ON|OFF\n");
-    printf("cmd <DST> <ACK> WIFI ON|OFF\n");
-    printf("cmd <DST> <ACK> CRYPTO ON|OFF\n");
-    printf("cmd <DST> <ACK> GPS\n");
-    printf("cmd <DST> <ACK> BATT\n");
-    printf("cmd <DST> <ACK> VERSION\n");
-    printf("cmd <DST> <ACK> REBOOT\n\n");
-
-    printf("Configuration\n");
-    printf("-------------\n");
+    printf("role 0|1|2       (0=RELAY 1=EDGE 2=SENSOR)\n");
+    printf("crypto on|off\n");
     printf("cfg get\n");
-    printf("cfg set <key> <value>\n");
+    printf("cfg set <key> <val>\n");
     printf("cfg save\n");
     printf("cfg load\n");
     printf("cfg defaults\n");
     printf("cfg apply\n");
-
-    printf("\n---------------------\n\n");
+#if MR_RELAY_ENABLE
+    printf("relay on|off|toggle\n");
+#endif
+    printf("send <DST> <ACK 0|1> <TEXT...>\n");
+    printf("cmd  <DST> <ACK 0|1> STATUS|RELAY ON|RELAY OFF|RELAY TOGGLE|CRYPTO ON|CRYPTO OFF|DISPLAY ON|DISPLAY OFF|WIFI ON|WIFI OFF|GPS|BATT|VERSION|REBOOT\n");
+    printf("---------------------\n\n");
 }
 
 static void trim_line(char *s)
@@ -4574,24 +4510,6 @@ static void cli_handle_line(char *line)
 
     if(streq_ci(cmd,"h") || streq_ci(cmd,"help")){
         cli_print_help();
-        return;
-    }
-
-    if(streq_ci(cmd,"version")){
-        const esp_app_desc_t *app = esp_app_get_description();
-        printf("FW: %s\n", app ? app->version : "unknown");
-        printf("Project: %s\n", app ? app->project_name : "unknown");
-        printf("Build: %s %s\n",
-               app ? app->date : "?",
-               app ? app->time : "?");
-        return;
-    }
-
-    if(streq_ci(cmd,"reboot")){
-        printf("OK rebooting\n");
-        fflush(stdout);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        esp_restart();
         return;
     }
 

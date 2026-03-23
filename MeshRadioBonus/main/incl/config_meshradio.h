@@ -101,7 +101,7 @@
  *   - Auswahl des aktiven Boards
  */
 #ifndef MR_BOARD_PRESET
-#define MR_BOARD_PRESET MR_BOARD_TBEAM_V12_AXP2101
+#define MR_BOARD_PRESET MR_BOARD_HELTEC_V3
 #endif
 
 /* -----------------------------------------------------------
