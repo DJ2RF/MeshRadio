@@ -22,7 +22,7 @@ Funktionen
 - One-shot Auto Command beim nächsten AWAKE
 - Link-Quality-Anzeige auf Basis des RSSI
 - Node-Liste mit Last-Seen-Zeiten
-- TX-Window-Schutz
+- TX-Window-Anzeige (nur für One-shot Auto Command)
 - Help-Button mit Online-Dokumentation
 - RX-Textlog mit DST-Filter
 
@@ -615,18 +615,6 @@ def start_control_window(args, root):
         dst = varDst.get().strip() or args.dst
         full = make_send_cmd(dst, 1, payload)
 
-        if args.always_allow_tx:
-            if send_cli_line(full):
-                set_status(f"sent (ACK=1) to {dst}: {payload}", ok=True)
-            else:
-                set_status("TX failed (serial not ready?)", ok=False)
-            return
-
-        ok, _left = tx_window_ok(args.window)
-        if not ok:
-            set_status("TX window closed (wait for next AWAKE)", ok=False)
-            return
-
         if send_cli_line(full):
             set_status(f"sent (ACK=1) to {dst}: {payload}", ok=True)
         else:
@@ -868,10 +856,10 @@ def start_control_window(args, root):
         ok, left = tx_window_ok(args.window)
         if ok:
             lamp_canvas.itemconfig(lamp, fill="green")
-            lblCnt.config(text=f"{left}s (open)")
+            lblCnt.config(text=f"{left}s (auto only)")
         else:
             lamp_canvas.itemconfig(lamp, fill="grey")
-            lblCnt.config(text="closed")
+            lblCnt.config(text="closed (auto only)")
 
         with S.lock:
             armed = S.auto_armed
@@ -938,7 +926,7 @@ def main():
     S = Shared(max_points=args.max_points, rx_log_lines=args.rx_log_lines)
 
     root = tk.Tk()
-    root.geometry("1200x980")
+    root.geometry("800x690") # 1200x980") 
 
     th = threading.Thread(target=serial_reader, args=(args,), daemon=True)
     th.start()

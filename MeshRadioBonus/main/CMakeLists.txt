@@ -13,4 +13,7 @@ idf_component_register(SRCS "main.c"
                         "aprs.c"
                         "aprs_web.c"
                         "bme280.c"
+                        "mr_web_ui.c"
+                        "mr_web_cmdcfg.c"
+                        "mr_cmd_trigger.c"
                     INCLUDE_DIRS ".")

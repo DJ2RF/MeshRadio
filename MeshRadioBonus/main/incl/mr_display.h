@@ -51,6 +51,7 @@ esp_err_t mr_display_sleep(bool en);
 esp_err_t mr_display_set_contrast(uint8_t contrast);
 esp_err_t mr_display_flush(void);
 
+void mr_display_power(bool on);
 /*
  * line = 0..7 (8 Textzeilen bei 128x64 und 5x7 Font)
  * x    = Pixelposition, sinnvoll meist 0

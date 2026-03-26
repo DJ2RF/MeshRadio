@@ -219,6 +219,12 @@ void mr_cfg_defaults(mr_cfg_t *c)
 
     c->relay_feature_enable = (MR_RELAY_ENABLE ? true : false);
     c->relay_gpio = RELAY_GPIO;
+
+    c->cmd_enable = false;
+    c->cmd_trigger_gpio = -1;
+    c->cmd_status_led_gpio = -1;
+    c->cmd_dst[0] = 0;
+    c->cmd_text[0] = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -482,6 +488,12 @@ bool mr_cfg_set_kv(mr_cfg_t *c, const char *key, const char *val)
         return true;
     }
 
+    if (strcmp(key, "cmd_enable") == 0) {
+        if (!parse_bool(val, &bv)) return false;
+        c->cmd_enable = bv;
+        return true;
+    }
+
     /* --- integers --- */
     uint32_t u32 = 0;
 
@@ -558,6 +570,20 @@ bool mr_cfg_set_kv(mr_cfg_t *c, const char *key, const char *val)
         return true;
     }
 
+    if (strcmp(key, "cmd_trigger_gpio") == 0) {
+        if (!parse_i8(val, &i8)) return false;
+        if (i8 < -1 || i8 > 48) return false;
+        c->cmd_trigger_gpio = i8;
+        return true;
+    }
+
+    if (strcmp(key, "cmd_status_led_gpio") == 0) {
+        if (!parse_i8(val, &i8)) return false;
+        if (i8 < -1 || i8 > 48) return false;
+        c->cmd_status_led_gpio = i8;
+        return true;
+    }
+
     /* --- strings --- */
     if (strcmp(key, "ssid") == 0) {
         if (strlen(val) >= sizeof(c->wifi_ssid)) return false;
@@ -597,6 +623,20 @@ bool mr_cfg_set_kv(mr_cfg_t *c, const char *key, const char *val)
         strncpy(c->relay_callsign, val, 8);
         c->relay_callsign[8] = 0;
         str7_sanitize(c->relay_callsign);
+        return true;
+    }
+
+    if (strcmp(key, "cmd_dst") == 0) {
+        if (strlen(val) < 1 || strlen(val) > 8) return false;
+        strncpy(c->cmd_dst, val, 8);
+        c->cmd_dst[8] = 0;
+        str7_sanitize(c->cmd_dst);
+        return true;
+    }
+
+    if (strcmp(key, "cmd_text") == 0) {
+        if (strlen(val) < 1 || strlen(val) >= sizeof(c->cmd_text)) return false;
+        strcpy(c->cmd_text, val);
         return true;
     }
 
@@ -652,6 +692,11 @@ void mr_cfg_to_json(const mr_cfg_t *c, char *out, size_t out_sz)
         "\"bme280\":%u,"
         "\"display\":%u,"
         "\"relay_gpio\":%d,"
+        "\"cmd_enable\":%u,"
+        "\"cmd_trigger_gpio\":%d,"
+        "\"cmd_status_led_gpio\":%d,"
+        "\"cmd_dst\":\"%s\","
+        "\"cmd_text\":\"%s\","
         "\"sensor_wake_ms\":%lu,"
         "\"sensor_rxwin_ms\":%lu"
         "}",
@@ -676,6 +721,11 @@ void mr_cfg_to_json(const mr_cfg_t *c, char *out, size_t out_sz)
         c->bme280_enable ? 1 : 0,
         c->display_enable ? 1 : 0,
         (int)c->relay_gpio,
+        c->cmd_enable ? 1 : 0,
+        (int)c->cmd_trigger_gpio,
+        (int)c->cmd_status_led_gpio,
+        c->cmd_dst,
+        c->cmd_text,
         (unsigned long)c->sensor_wake_period_ms,
         (unsigned long)c->sensor_boot_rx_window_ms
     );

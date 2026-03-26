@@ -50,6 +50,8 @@
 #include "incl/aprs.h"
 #include "incl/aprs_web.h"
 #include "incl/bme280.h"
+#include "incl/mr_web_ui.h"
+#include "incl/mr_cmd_trigger.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -287,6 +289,8 @@ static bool g_ap_part_enabled = false;
 static char g_last_rx_from[9]   = "";
 static char g_last_rx_text[180] = "";
 static uint32_t g_last_rx_ms    = 0;
+static int g_last_rx_rssi       = -127;
+static uint32_t g_last_rx_scroll_reset = 0;
 
 #if MR_RELAY_ENABLE
 static bool g_relay_on=false;
@@ -298,7 +302,7 @@ void lora_set_rx_continuous(void);
 void lora_recover_radio(void);
 //void lora_send_frame(const uint8_t *d, size_t len);
 //bool lora_try_read_frame(uint8_t *buf, size_t maxlen, uint8_t *out_len, int *out_rssi);
-static void send_data_to(const char *dst_str, const char *txt, bool ackreq);
+void send_data_to(const char *dst_str, const char *txt, bool ackreq);
 
 // ADC
 #if MR_BATT_ENABLE
@@ -321,28 +325,136 @@ static void pwr_button_poll(void);
 // ============================================================================
 uint32_t now_ms(void){ return xTaskGetTickCount()*portTICK_PERIOD_MS; }
 
-/*static const char *cfg_board_str(void)
+static inline void apply_runtime_cfg_locked(void)
 {
-#if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
-    return "HELTEC_V3";
-#elif (MR_BOARD_PRESET == MR_BOARD_LILYGO_SX1276)
-    return "LILYGO_SX1276";
+    mr_cfg_apply(&g_cfg);
+    rtc_display_enable = g_display_enabled ? 1 : 0;
+
+#if MR_DISPLAY_ENABLE
+    if (g_display_enabled) {
+        mr_display_power(true);
+        if (mr_display_present() != ESP_OK) {
+            (void)mr_display_init();
+        }
+    } else {
+        mr_display_power(false);
+    }
+#endif
+
+    mr_cmd_trigger_apply_cfg();
+}
+
+
+static void build_rx_scroll_window(const char *src, char *dst, size_t dst_sz, uint32_t step)
+{
+    if (dst == NULL || dst_sz == 0) return;
+    dst[0] = 0;
+
+    const size_t width = MR_DISPLAY_CHARS_PER_LINE;
+    if (src == NULL || src[0] == 0) {
+        return;
+    }
+
+    const size_t len = strlen(src);
+    if (len <= width) {
+        snprintf(dst, dst_sz, "%s", src);
+        return;
+    }
+
+    const size_t gap = width;
+    const size_t cycle = len + gap;
+    const size_t off = (size_t)step % cycle;
+
+    size_t copy = width;
+    if (copy >= dst_sz) copy = dst_sz - 1;
+
+    for (size_t i = 0; i < copy; i++) {
+        size_t pos = off + i;
+        if (pos < len) {
+            dst[i] = src[pos];
+        } else if (pos < cycle) {
+            dst[i] = ' ';
+        } else {
+            dst[i] = src[pos - cycle];
+        }
+    }
+    dst[copy] = 0;
+}
+
+static void render_last_rx_display_locked(uint32_t scroll_step)
+{
+#if MR_DISPLAY_ENABLE
+    if (!g_display_enabled) return;
+    if (g_last_rx_ms == 0) return;
+
+    char from[9];
+    char text[180];
+    char line3[24];
+    char line4[MR_DISPLAY_CHARS_PER_LINE + 1];
+    char dt[20] = "";
+    char dt2[24] = "";
+    const char *line5 = "";
+
+    strncpy(from, g_last_rx_from, sizeof(from) - 1);
+    from[sizeof(from) - 1] = 0;
+    strncpy(text, g_last_rx_text, sizeof(text) - 1);
+    text[sizeof(text) - 1] = 0;
+
+    snprintf(line3, sizeof(line3), "rssi=%d", g_last_rx_rssi);
+    build_rx_scroll_window(text, line4, sizeof(line4), scroll_step);
+
+    if (mr_time_net_get_datetime(dt, sizeof(dt))) {
+        snprintf(dt2, sizeof(dt2), "   %s", dt);
+        line5 = dt2;
+    }
+
+    mr_display_show_status8(
+        "LAST RX",
+        "",
+        from,
+        line3,
+        line4,
+        "",
+        line5,
+        ""
+    );
 #else
-    return "UNKNOWN";
+    (void)scroll_step;
 #endif
 }
 
-static const char *cfg_lora_chip_str(void)
+static void rx_display_task(void *arg)
 {
-#if defined(MR_LORA_CHIP_SX1262)
-    return "SX1262";
-#elif defined(MR_LORA_CHIP_SX1276)
-    return "SX1276";
-#else
-    return "UNKNOWN";
-#endif
+    (void)arg;
+    uint32_t scroll_step = 0;
+    uint32_t last_reset_seen = 0;
+
+    while (1) {
+        bool do_render = false;
+
+        xSemaphoreTake(g_mutex, portMAX_DELAY);
+
+        if (last_reset_seen != g_last_rx_scroll_reset) {
+            scroll_step = 0;
+            last_reset_seen = g_last_rx_scroll_reset;
+        }
+
+        if (g_display_enabled && g_last_rx_ms != 0) {
+            uint32_t age = now_ms() - g_last_rx_ms;
+            if (age <= 15000) {
+                do_render = true;
+            }
+        }
+
+        if (do_render) {
+            render_last_rx_display_locked(scroll_step++);
+        }
+        xSemaphoreGive(g_mutex);
+
+        vTaskDelay(pdMS_TO_TICKS(do_render ? 350 : 1000));
+    }
 }
-*/
+
 static const char *cfg_board_str(void)
 {
 #if (MR_BOARD_PRESET == MR_BOARD_HELTEC_V3)
@@ -519,7 +631,15 @@ static void prog_button_poll(void)
             g_cfg.display_enable = !g_cfg.display_enable;
             rtc_display_enable = g_cfg.display_enable ? 1 : 0;
             (void)mr_cfg_save_nvs(&g_cfg);
-            mr_cfg_apply(&g_cfg);
+            apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             xSemaphoreGive(g_mutex);
 
             if (g_display_enabled) {
@@ -627,7 +747,15 @@ static void pwr_button_poll(void)
             g_cfg.display_enable = !g_cfg.display_enable;
             rtc_display_enable = g_cfg.display_enable ? 1 : 0;
             (void)mr_cfg_save_nvs(&g_cfg);
-            mr_cfg_apply(&g_cfg);
+            apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             xSemaphoreGive(g_mutex);
 
             if (g_display_enabled) {
@@ -2496,7 +2624,15 @@ static esp_err_t api_cfg_defaults_post(httpd_req_t *req)
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     mr_cfg_defaults(&g_cfg);
     (void)parse_key_hex16(MR_NET_KEY_HEX, g_cfg.net_key); // compile-time default key
-    mr_cfg_apply(&g_cfg);
+    apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
     xSemaphoreGive(g_mutex);
     return http_send_text(req, "OK defaults");
 }
@@ -2504,7 +2640,15 @@ static esp_err_t api_cfg_defaults_post(httpd_req_t *req)
 static esp_err_t api_cfg_apply_post(httpd_req_t *req)
 {
     xSemaphoreTake(g_mutex, portMAX_DELAY);
-    mr_cfg_apply(&g_cfg);
+    apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
     xSemaphoreGive(g_mutex);
 
     return http_send_text(req, "OK applying");
@@ -2566,7 +2710,15 @@ static esp_err_t api_cfg_load_post(httpd_req_t *req)
     bool ok=false;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     ok = mr_cfg_load_nvs(&g_cfg);
-    if(ok) mr_cfg_apply(&g_cfg);
+    if(ok) apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
     xSemaphoreGive(g_mutex);
     return http_send_text(req, ok ? "OK loaded" : "ERR load");
 }
@@ -3100,49 +3252,8 @@ static const char *INDEX_HTML =
 
 static esp_err_t index_get(httpd_req_t *req)
 {
-    static char html[28672];
-    const char *needle_url = "__MR_URL__";
-    const char *needle_btn = "__APRS_BUTTON__";
-    const char *url = wifi_get_current_url();
-    const char *btn = "";
-    const mr_board_info_t *b = mr_board_get();
-
-    if(b){
-        btn = "<div class='card'><h3>APRS</h3><button onclick=\"location.href='/aprs'\">APRS Config</button></div>";
-    }
-
     httpd_resp_set_type(req, "text/html");
-
-    const char *p1 = strstr(INDEX_HTML, needle_url);
-    if(!p1){
-        return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-    }
-
-    size_t a_len = (size_t)(p1 - INDEX_HTML);
-    const char *after_url = p1 + strlen(needle_url);
-    const char *p2 = strstr(after_url, needle_btn);
-    if(!p2){
-        return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-    }
-
-    size_t b_len = (size_t)(p2 - after_url);
-    const char *after_btn = p2 + strlen(needle_btn);
-    size_t c_len = strlen(after_btn);
-
-    size_t need = a_len + strlen(url) + b_len + strlen(btn) + c_len + 1;
-    if(need > sizeof(html)){
-        return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-    }
-
-    char *w = html;
-    memcpy(w, INDEX_HTML, a_len); w += a_len;
-    memcpy(w, url, strlen(url)); w += strlen(url);
-    memcpy(w, after_url, b_len); w += b_len;
-    memcpy(w, btn, strlen(btn)); w += strlen(btn);
-    memcpy(w, after_btn, c_len); w += c_len;
-    *w = 0;
-
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, mr_web_ui_html(), HTTPD_RESP_USE_STRLEN);
 }
 
 // ============================================================================
@@ -3202,12 +3313,14 @@ static esp_err_t api_status_get(httpd_req_t *req)
     off += snprintf(out+off, sizeof(out)-off,
         "{"
         "\"call\":\"%s\","
+        "\"callsign\":\"%s\","
         "\"crypto_enable\":%u,"
         "\"node_mode\":%d,"
         "\"node_mode_str\":\"%s\","
         "\"board\":\"%s\","
         "\"chip\":\"%s\","
         "\"fw\":\"%s\","
+        "\"version\":\"%s\","
         "\"proto\":%u,"
         "\"display\":%u,"
         "\"display_cfg\":%u,"
@@ -3216,11 +3329,13 @@ static esp_err_t api_status_get(httpd_req_t *req)
         "\"batt\":\"%s\","
         "\"secstats\":\"",
         g_callsign_rt,
+        g_callsign_rt,
         g_crypto_enable ? 1 : 0,
         (int)g_node_mode,
         node_mode_str(g_node_mode),
         cfg_board_str(),
         cfg_lora_chip_str(),
+        esp_app_get_description()->version,
         esp_app_get_description()->version,
         (unsigned)MR_PROTO_VERSION,
         g_display_enabled ? 1 : 0,
@@ -3402,7 +3517,7 @@ static esp_err_t api_routes_get(httpd_req_t *req)
 // ============================================================================
 // ============================== API: POSTs ==================================
 // ============================================================================
-static void send_data_to(const char *dst_str, const char *txt, bool ackreq); // forward
+void send_data_to(const char *dst_str, const char *txt, bool ackreq); // forward
 
 static esp_err_t api_send_post(httpd_req_t *req)
 {
@@ -3783,7 +3898,15 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
     if(strcmp(txt, "CMD:CRYPTO ON")==0 || strcmp(txt, "CRYPTO ON")==0){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.crypto_enable = true;
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "CRYPTO: ON");
         return;
@@ -3792,7 +3915,15 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
     if(strcmp(txt, "CMD:CRYPTO OFF")==0 || strcmp(txt, "CRYPTO OFF")==0){
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.crypto_enable = false;
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "CRYPTO: OFF");
         return;
@@ -3803,7 +3934,15 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
         g_cfg.display_enable = true;
         rtc_display_enable = 1;
         (void)mr_cfg_save_nvs(&g_cfg);
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "DISPLAY: ON");
         return;
@@ -3814,7 +3953,15 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
         g_cfg.display_enable = false;
         rtc_display_enable = 0;
         (void)mr_cfg_save_nvs(&g_cfg);
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, "DISPLAY: OFF");
         return;
@@ -3825,7 +3972,15 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.wifi_enable = true;
         ok = mr_cfg_save_nvs(&g_cfg);
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, ok ? "WIFI: ON" : "WIFI: ON (NOT SAVED)");
         return;
@@ -3836,7 +3991,15 @@ static void app_handle_cmd_if_any(const char from7[8], const char *txt)
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         g_cfg.wifi_enable = false;
         ok = mr_cfg_save_nvs(&g_cfg);
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
         xSemaphoreGive(g_mutex);
         app_send_reply_to_sender(from7, ok ? "WIFI: OFF" : "WIFI: OFF (NOT SAVED)");
         return;
@@ -3964,7 +4127,7 @@ static void send_ack(const mr_hdr_v7_t *rx)
     }
 }
 
-static void send_data_to(const char *dst_str, const char *txt, bool ackreq)
+void send_data_to(const char *dst_str, const char *txt, bool ackreq)
 {
     uint8_t buf[sizeof(mr_hdr_v7_t) + MAX_PAYLOAD]={0};
     mr_hdr_v7_t *h=(mr_hdr_v7_t*)buf;
@@ -4123,11 +4286,16 @@ static void handle_rx(void)
              rssi); */
     // ACK: not duplicate filtered
     if(h->flags & MR_FLAG_ACK){
+        char ack_from[9];
+        call7_to_str(ack_from, h->src);
+
         xSemaphoreTake(g_mutex, portMAX_DELAY);
         neighbor_update_rssi_locked(h->last_hop, rssi);
         neighbor_ack_ok_locked(h->src);
         pending_mark_acked_locked(h->msg_id, h->src);
         xSemaphoreGive(g_mutex);
+
+        mr_cmd_trigger_mark_confirmed(ack_from);
         return;
     }
 
@@ -4254,6 +4422,7 @@ static void handle_rx(void)
             g_last_rx_from[sizeof(g_last_rx_from)-1]=0;
             strncpy(g_last_rx_text, txt, sizeof(g_last_rx_text)-1);
             g_last_rx_text[sizeof(g_last_rx_text)-1]=0;
+            g_last_rx_rssi = rssi;
             g_last_rx_ms = now_ms();
             xSemaphoreGive(g_mutex);
 
@@ -4278,49 +4447,8 @@ static void handle_rx(void)
                 }
             }
 
-            char wx_str[16] = "";
-            float temp;
-
-            if (strstr(txt, "WX")) {
-                char *p = strstr(txt, "t=");
-                if (p && sscanf(p, "t=%f", &temp) == 1) {
-                    snprintf(wx_str, sizeof(wx_str), "T=%.2f C", temp);
-                }
-            }
-
-            char dt[20] = "";
-            char dt2[24] = "";
-            char line4[24] = "";
-            const char *line4_eff = line4;
-
-            mr_time_net_get_datetime(dt, sizeof(dt));
-
-            if (mr_time_net_get_datetime(dt, sizeof(dt))) {
-                snprintf(dt2, sizeof(dt2), "   %s", dt); 
-                line4_eff = dt2;
-            }
-
             if (g_display_enabled) {
-                mr_display_clear();
-
-                char line3[24];
-
-                if (wx_str[0]) {
-                    snprintf(line3, sizeof(line3), "rssi=%d %.10s", rssi, wx_str);
-                } else {
-                    snprintf(line3, sizeof(line3), "rssi=%d", rssi);
-                }
-
-                mr_display_show_status8(
-                        "LAST RX",
-                        "",
-                        from_str,
-                        line3,
-                        "",
-                        line4_eff,
-                        "",
-                        ""
-                    );
+                render_last_rx_display_locked(0);
             }
 
             app_handle_cmd_if_any(h->src, txt);
@@ -4665,13 +4793,29 @@ static void cli_handle_line(char *line)
         if(streq_ci(arg,"on")){
             g_cfg.wifi_enable = true;
             save_ok = mr_cfg_save_nvs(&g_cfg);
-            mr_cfg_apply(&g_cfg);
+            apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             ok = true;
         }
         else if(streq_ci(arg,"off")){
             g_cfg.wifi_enable = false;
             save_ok = mr_cfg_save_nvs(&g_cfg);
-            mr_cfg_apply(&g_cfg);
+            apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             ok = true;
         }
 
@@ -4709,11 +4853,27 @@ static void cli_handle_line(char *line)
 
     if(streq_ci(arg,"on")){
         g_cfg.crypto_enable = true;
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
     }
     else if(streq_ci(arg,"off")){
         g_cfg.crypto_enable = false;
-        mr_cfg_apply(&g_cfg);
+        apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
     }
     else{
         xSemaphoreGive(g_mutex);
@@ -4847,7 +5007,15 @@ static void cli_handle_line(char *line)
             bool ok=false;
             xSemaphoreTake(g_mutex, portMAX_DELAY);
             ok = mr_cfg_set_kv(&g_cfg, k, v);
-            if(ok) mr_cfg_apply(&g_cfg);
+            if(ok) apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             xSemaphoreGive(g_mutex);
             printf(ok ? "OK\n" : "ERR invalid\n");
             return;
@@ -4864,7 +5032,15 @@ static void cli_handle_line(char *line)
             bool ok=false;
             xSemaphoreTake(g_mutex, portMAX_DELAY);
             ok = mr_cfg_load_nvs(&g_cfg);
-            if(ok) mr_cfg_apply(&g_cfg);
+            if(ok) apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             xSemaphoreGive(g_mutex);
             printf(ok ? "OK loaded\n" : "ERR load\n");
             return;
@@ -4874,14 +5050,30 @@ static void cli_handle_line(char *line)
             mr_cfg_defaults(&g_cfg);
             // keep key from compile-time if you want:
             (void)parse_key_hex16(MR_NET_KEY_HEX, g_cfg.net_key);
-            mr_cfg_apply(&g_cfg);
+            apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             xSemaphoreGive(g_mutex);
             printf("OK defaults applied\n");
             return;
         }
         if(streq_ci(sub,"apply")){
             xSemaphoreTake(g_mutex, portMAX_DELAY);
-            mr_cfg_apply(&g_cfg);
+            apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
             xSemaphoreGive(g_mutex);
             printf("OK applied\n");
             return;
@@ -5220,7 +5412,16 @@ void app_main(void)
     g_tx_power_dbm_runtime = g_cfg.tx_power_dbm;
     g_relay_gpio_runtime   = g_cfg.relay_gpio;
 
-    mr_cfg_apply(&g_cfg);
+    mr_cmd_trigger_init();
+    apply_runtime_cfg_locked();
+
+#if MR_DISPLAY_ENABLE
+    if(g_display_enabled){
+        if(mr_display_present() != ESP_OK){
+            mr_display_init();
+        }
+    }
+#endif
 
     config_print();
 
@@ -5259,6 +5460,10 @@ void app_main(void)
 
     // Retry-Task für ACKREQ/Resend
     xTaskCreate(retry_task, "retry", 4096, NULL, 6, NULL);
+
+#if MR_DISPLAY_ENABLE
+    xTaskCreate(rx_display_task, "rx_display", 4096, NULL, 3, NULL);
+#endif
 
 #if MR_CLI_ENABLE
     xTaskCreate(cli_task, "cli", 4096, NULL, 5, NULL);
@@ -5455,6 +5660,7 @@ sensor_awake_window(SENSOR_BOOT_RX_WINDOW_MS);
     // ------------------------------------------------------------------------
     while(1){
         vTaskDelay(pdMS_TO_TICKS(50));
+        mr_cmd_trigger_poll();
 
 #if MR_BATT_ENABLE
         batt_poll();

@@ -48,6 +48,14 @@ typedef struct {
     // Relay
     bool     relay_feature_enable;
     int8_t   relay_gpio;
+
+    // Command Trigger
+    bool     cmd_enable;
+    int8_t   cmd_trigger_gpio;
+    int8_t   cmd_status_led_gpio;
+    char     cmd_dst[9];      // 8 chars + 0
+    char     cmd_text[97];    // 96 chars + 0
+
     // Wetterdaten GPIO's Fest / Target
     bool     bme280_enable;
     bool     display_enable;

@@ -202,7 +202,12 @@ void mr_display_power(bool on)
 
     (void)gpio_reset_pin(pin);
     (void)gpio_set_direction(pin, GPIO_MODE_OUTPUT);
-    (void)gpio_set_level(pin, on ? 0 : 1);   // Heltec VEXT: LOW = ON
+    (void)gpio_set_level(pin, on ? 0 : 1);
+
+    if(!on){
+        s_info.initialized = false;
+        s_info.found = false;
+    }   // Heltec VEXT: LOW = ON
 #else
     (void)on;
 #endif
@@ -259,13 +264,20 @@ esp_err_t mr_display_init(void)
              MR_DISPLAY_I2C_ADDR);
 
     mr_display_power(true);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(250));
 
     ESP_RETURN_ON_ERROR(mr_display_hw_reset(), TAG, "display reset failed");
     ESP_RETURN_ON_ERROR(mr_display_bus_init(), TAG, "i2c bus init failed");
     ESP_RETURN_ON_ERROR(mr_display_dev_init(), TAG, "i2c add device failed");
 
-    esp_err_t err = i2c_master_probe(s_i2c_bus, MR_DISPLAY_I2C_ADDR, pdMS_TO_TICKS(100));
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        err = i2c_master_probe(s_i2c_bus, MR_DISPLAY_I2C_ADDR, pdMS_TO_TICKS(100));
+        if (err == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     if (err != ESP_OK) {
         s_info.initialized = false;
         s_info.found = false;
